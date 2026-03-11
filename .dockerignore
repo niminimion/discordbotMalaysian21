@@ -1,0 +1,6 @@
+.env
+bot_data.db
+__pycache__/
+*.pyc
+.git
+fly.toml
