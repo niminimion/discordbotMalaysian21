@@ -660,9 +660,8 @@ def build_board_embed(table: GameTable, *, reveal: bool = False) -> discord.Embe
         embed.add_field(name=label, value=value or "—", inline=False)
 
     if not reveal and table.phase == "playing" and current:
-        score_hint = f" (score: {current.hand.score})" if current.hand.must_hit else ""
         embed.set_footer(
-            text=f"▶️ {current.name}'s turn{score_hint}  |  Bet: {table.bet} XP each"
+            text=f"▶️ {current.name}'s turn  |  Bet: {table.bet} XP each"
         )
     return embed
 
