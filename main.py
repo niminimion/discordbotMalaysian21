@@ -158,6 +158,15 @@ else:
     db.commit()
     print(f"[DB] Connected → {DB_PATH}")
 
+# Tokens table — shared between both DB backends (BIGINT is valid in SQLite too)
+db.execute("""
+    CREATE TABLE IF NOT EXISTS user_tokens (
+        user_id  BIGINT  PRIMARY KEY,
+        tokens   INTEGER NOT NULL DEFAULT 0
+    )
+""")
+db.commit()
+
 
 # ---------------------------------------------------------------------------
 # Bot / Intent Setup
@@ -197,6 +206,40 @@ def add_xp(user_id: int, amount: int) -> None:
         """,
         (user_id, new_xp),
     )
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Token helpers  (free-play only; no floor — can go negative)
+# ---------------------------------------------------------------------------
+
+FREE_PLAY_TOKEN_BET: int = 1   # default bet size for every free-play game
+
+
+def get_tokens(user_id: int) -> int:
+    """Return the player's current token balance (0 for first-timers)."""
+    row = db.execute(
+        "SELECT tokens FROM user_tokens WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def add_tokens(user_id: int, amount: int) -> None:
+    """Upsert token balance — no floor, may go negative."""
+    new_val = get_tokens(user_id) + amount
+    db.execute(
+        """
+        INSERT INTO user_tokens (user_id, tokens) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET tokens = excluded.tokens
+        """,
+        (user_id, new_val),
+    )
+    db.commit()
+
+
+def reset_all_tokens() -> None:
+    """Zero-out every row in the tokens table."""
+    db.execute("UPDATE user_tokens SET tokens = 0")
     db.commit()
 
 
@@ -647,22 +690,50 @@ async def resolve_table(
     table.phase = "finished"
     banker      = table.banker
     banker_net  = 0
+    free_play   = table.bet == 0
     lines: list[str] = []
 
-    for player in table.players:
-        if player.escaped:
-            lines.append(f"**{player.name}**: 🏃 Escaped (bet refunded)")
-            continue
-
-        xp_ret, desc = _calc_payout(player, banker, table.bet)
-        add_xp(player.user_id, xp_ret)
-        lines.append(f"**{player.name}**: {desc}")
-        banker_net += (table.bet - xp_ret)
-
-    banker_total = table.banker_escrow + banker_net
-    add_xp(table.banker_id, max(0, banker_total))
-    net_str = f"+{banker_net}" if banker_net >= 0 else str(banker_net)
-    lines.append(f"**{banker.name} (Banker)**: Net **{net_str}** XP")
+    if free_play:
+        # ── Free play: settle tokens (no XP changes) ────────────────────────
+        tok_banker_net = 0
+        tok_lines: list[str] = []
+        for player in table.players:
+            if player.escaped:
+                lines.append(f"**{player.name}**: 🏃 Escaped")
+                tok_lines.append(f"**{player.name}**: 🏃 Escaped")
+                continue
+            tok_ret, desc = _calc_payout(player, banker, FREE_PLAY_TOKEN_BET)
+            tok_delta     = tok_ret - FREE_PLAY_TOKEN_BET
+            add_tokens(player.user_id, tok_delta)
+            tok_banker_net -= tok_delta
+            sign = "+" if tok_delta >= 0 else ""
+            new_bal = get_tokens(player.user_id)
+            lines.append(f"**{player.name}**: {desc}")
+            tok_lines.append(
+                f"**{player.name}**: {sign}{tok_delta:,} 🪙 → **{new_bal:,}**"
+            )
+        add_tokens(table.banker_id, tok_banker_net)
+        b_sign = "+" if tok_banker_net >= 0 else ""
+        b_bal  = get_tokens(table.banker_id)
+        lines.append(f"**{banker.name} (Banker)**: Net **{b_sign}{tok_banker_net:,}** tokens")
+        tok_lines.append(
+            f"**{banker.name} (Banker)**: {b_sign}{tok_banker_net:,} 🪙 → **{b_bal:,}**"
+        )
+    else:
+        # ── Staked play: settle XP ───────────────────────────────────────────
+        tok_lines = None
+        for player in table.players:
+            if player.escaped:
+                lines.append(f"**{player.name}**: 🏃 Escaped (bet refunded)")
+                continue
+            xp_ret, desc = _calc_payout(player, banker, table.bet)
+            add_xp(player.user_id, xp_ret)
+            lines.append(f"**{player.name}**: {desc}")
+            banker_net += (table.bet - xp_ret)
+        banker_total = table.banker_escrow + banker_net
+        add_xp(table.banker_id, max(0, banker_total))
+        net_str = f"+{banker_net}" if banker_net >= 0 else str(banker_net)
+        lines.append(f"**{banker.name} (Banker)**: Net **{net_str}** XP")
 
     # ── 1. Edit board to reveal cards; disable all buttons ──────────────────
     board_embed = build_board_embed(table, reveal=True)
@@ -671,16 +742,21 @@ async def resolve_table(
     await interaction.response.edit_message(content="", embed=board_embed, view=game_view)
 
     # ── 2. New channel message with results + everyone mentioned ────────────
-    all_mentions  = " ".join(f"<@{p.user_id}>" for p in table.all_participants)
-    free_play     = table.bet == 0
-    result_embed  = discord.Embed(
+    all_mentions = " ".join(f"<@{p.user_id}>" for p in table.all_participants)
+    result_embed = discord.Embed(
         title="🏁  Game Over — Results",
         description=f"{all_mentions}\n\n" + "\n".join(lines),
         color=discord.Color.blurple(),
     )
-    result_embed.set_footer(
-        text="Free Play — no XP changed" if free_play else f"Bet: {table.bet} XP each"
-    )
+    if free_play and tok_lines:
+        result_embed.add_field(
+            name="🪙 Token Balances",
+            value="\n".join(tok_lines),
+            inline=False,
+        )
+        result_embed.set_footer(text=f"Free Play — bet {FREE_PLAY_TOKEN_BET} tokens each | use !tokens to check balance")
+    else:
+        result_embed.set_footer(text=f"Bet: {table.bet} XP each")
 
     # ── 3. Rematch button ────────────────────────────────────────────────────
     participants  = [(p.user_id, p.name) for p in table.all_participants]
@@ -1227,20 +1303,43 @@ class LobbyView(ui.View):
         """Immediate resolution when all turns end on the deal (edge case)."""
         banker     = table.banker
         banker_net = 0
+        free_play  = table.bet == 0
         lines: list[str] = []
 
-        for player in table.players:
-            if player.escaped:
-                lines.append(f"**{player.name}**: 🏃 Escaped")
-                continue
-            xp_ret, desc = _calc_payout(player, banker, table.bet)
-            add_xp(player.user_id, xp_ret)
-            lines.append(f"**{player.name}**: {desc}")
-            banker_net += (table.bet - xp_ret)
-
-        add_xp(table.banker_id, max(0, table.banker_escrow + banker_net))
-        net_str = f"+{banker_net}" if banker_net >= 0 else str(banker_net)
-        lines.append(f"**{banker.name} (Banker)**: Net **{net_str}** XP")
+        if free_play:
+            tok_banker_net = 0
+            tok_lines: list[str] = []
+            for player in table.players:
+                if player.escaped:
+                    lines.append(f"**{player.name}**: 🏃 Escaped")
+                    tok_lines.append(f"**{player.name}**: 🏃 Escaped")
+                    continue
+                tok_ret, desc = _calc_payout(player, banker, FREE_PLAY_TOKEN_BET)
+                tok_delta = tok_ret - FREE_PLAY_TOKEN_BET
+                add_tokens(player.user_id, tok_delta)
+                tok_banker_net -= tok_delta
+                sign   = "+" if tok_delta >= 0 else ""
+                new_bal = get_tokens(player.user_id)
+                lines.append(f"**{player.name}**: {desc}")
+                tok_lines.append(f"**{player.name}**: {sign}{tok_delta:,} 🪙 → **{new_bal:,}**")
+            add_tokens(table.banker_id, tok_banker_net)
+            b_sign = "+" if tok_banker_net >= 0 else ""
+            b_bal  = get_tokens(table.banker_id)
+            lines.append(f"**{banker.name} (Banker)**: Net **{b_sign}{tok_banker_net:,}** tokens")
+            tok_lines.append(f"**{banker.name} (Banker)**: {b_sign}{tok_banker_net:,} 🪙 → **{b_bal:,}**")
+        else:
+            tok_lines = None
+            for player in table.players:
+                if player.escaped:
+                    lines.append(f"**{player.name}**: 🏃 Escaped")
+                    continue
+                xp_ret, desc = _calc_payout(player, banker, table.bet)
+                add_xp(player.user_id, xp_ret)
+                lines.append(f"**{player.name}**: {desc}")
+                banker_net += (table.bet - xp_ret)
+            add_xp(table.banker_id, max(0, table.banker_escrow + banker_net))
+            net_str = f"+{banker_net}" if banker_net >= 0 else str(banker_net)
+            lines.append(f"**{banker.name} (Banker)**: Net **{net_str}** XP")
 
         board_embed = build_board_embed(table, reveal=True)
         for item in game_view.children:
@@ -1253,7 +1352,15 @@ class LobbyView(ui.View):
             description=f"{all_mentions}\n\n" + "\n".join(lines),
             color=discord.Color.blurple(),
         )
-        result_embed.set_footer(text=f"Bet: {table.bet} XP each")
+        if free_play and tok_lines:
+            result_embed.add_field(
+                name="🪙 Token Balances",
+                value="\n".join(tok_lines),
+                inline=False,
+            )
+            result_embed.set_footer(text=f"Free Play — bet {FREE_PLAY_TOKEN_BET} tokens each | use !tokens to check balance")
+        else:
+            result_embed.set_footer(text=f"Bet: {table.bet} XP each")
 
         participants = [(p.user_id, p.name) for p in table.all_participants]
         rematch_view = RematchView(bet=table.bet, participants=participants)
@@ -1315,6 +1422,32 @@ async def cmd_bj(ctx: commands.Context, bet: int = 0) -> None:
     view = LobbyView(table)
     msg  = await ctx.send(embed=build_lobby_embed(table), view=view)
     view.message = msg
+
+
+@bot.command(name="tokens")
+async def cmd_tokens(ctx: commands.Context, member: discord.Member = None) -> None:
+    """
+    !tokens          — show your own token balance
+    !tokens @someone — show that player's token balance
+    """
+    target = member or ctx.author
+    bal    = get_tokens(target.id)
+    sign   = "+" if bal > 0 else ""
+    color  = discord.Color.green() if bal >= 0 else discord.Color.red()
+    embed  = discord.Embed(
+        title=f"🪙 {target.display_name}'s Token Balance",
+        description=f"**{sign}{bal:,} tokens**",
+        color=color,
+    )
+    embed.set_footer(text="Earned via Free Play (!bj) | reset with !resettoken")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="resettoken")
+async def cmd_reset_token(ctx: commands.Context) -> None:
+    """Zero-out every player's token balance."""
+    reset_all_tokens()
+    await ctx.send("✅ All token balances have been reset to **0**.")
 
 
 @cmd_bj.error
