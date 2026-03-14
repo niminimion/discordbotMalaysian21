@@ -255,6 +255,7 @@ class PlayerState:
     hand:    Hand = field(default_factory=Hand)
     status:  str  = "active"
     escaped: bool = False
+    in_debt: bool = False
     # status values:
     #   "active"  — still playing, can Hit/Stand/Escape
     #   "stood"   — chose to Stand (score ≥ 16)
@@ -262,6 +263,8 @@ class PlayerState:
     #   "special" — triggered 五龙 or 7-7-7 during play (auto-stand)
     # escaped = True means player used the 15/16 Escape — bet refunded,
     #   skipped in payout loop
+    # in_debt = True means player had 0 or negative Gold when game started;
+    #   net winnings are subject to 30% interest tax
 
 
 # ---------------------------------------------------------------------------
@@ -279,8 +282,10 @@ class GameTable:
       FINISHED → all done; payout calculated
 
     Turn order: players in join order first, banker always last.
-    Banker escrow = bet × num_players × 5 (covers worst-case 5× for all).
+    Banker escrow = bet × num_players × 6 (covers worst-case 5× payout + stake return).
+    guild_id is stored so views can look up Gold balances in the correct server.
     """
+    guild_id:    int
     banker_id:   int
     banker_name: str
     bet:         int

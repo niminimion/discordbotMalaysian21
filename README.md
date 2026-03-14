@@ -1,7 +1,7 @@
-# Discord Bot MVP
+# Discord Bot
 
-A lightweight, economy-driven Discord bot built with Python 3 and `discord.py`.  
-XP and tokens are persistently stored — no data lost on restart.
+An economy-driven Discord gambling bot built with Python 3 and `discord.py`.  
+All data (Gold balances, tokens, daily cooldowns) persists across restarts via database.
 
 ---
 
@@ -34,75 +34,60 @@ python main.py
 
 ```
 Ctrl + C        ← stop
-python main.py  ← restart (XP and tokens are saved in the database)
+python main.py  ← restart (all data saved in the database)
 ```
 
 ---
 
-## Commands
+## Economy System — Gold 💰
+
+Gold is the primary currency. Balances are **guild-specific** — your Gold in Server A is completely separate from Server B.
 
 | Command | Example | Description |
 |---|---|---|
-| `!level` | `!level` | Show your XP balance, rank title, and level progress |
-| `!ht <bet> <h\|t>` | `!ht 50 h` | Wager XP on a 50/50 coin flip (`h` = heads, `t` = tails) |
-| `!bj [bet]` | `!bj 50` | Open a Ban-Luck lobby as banker; others join via button |
-| `!bj` | `!bj` | Free Play mode — no XP wagered, uses token system instead |
-| `!tokens [@user]` | `!tokens` / `!tokens @friend` | Show your (or someone else's) token balance |
-| `!resettoken` | `!resettoken` | Reset **all** players' tokens to 0 |
+| `/daily` | `/daily` | Claim **300 Gold** once every 24 hours |
+| `/balance [user]` | `/balance` / `/balance @friend` | Check your own or someone else's Gold balance |
+| `/leaderboard` | `/leaderboard` | Top 10 richest players in the current server |
+| `/disclaimer` | `/disclaimer` | Legal disclaimer — Gold, tokens, no real money, no gambling |
+
+### Debt System (Negative Balance)
+
+Players can go into **negative Gold** (debt). There is no floor.
+
+- If you attempt to start/join a **staked game** with ≤ 0 Gold, the bot shows a warning with **Continue / Cancel** buttons before proceeding.
+- If you **win** while having been in debt at the start of the game, a **30% interest tax** is applied to your net profit — rounded **up** (`ceil(net_profit × 0.30)`).
+- Use `/daily` to recover if you go broke.
 
 ---
 
-## XP & Level System
+## Games
 
-**Earning XP:** XP is awarded per message based on **character count** (not message count) to discourage spam.
+### Ban-Luck (Malaysian 21) — `!bj`
 
-| Message length | XP gained |
-|---|---|
-| 1–4 chars | 1 XP (minimum) |
-| ~25 chars | 5 XP |
-| ~50 chars | 10 XP |
-| 100+ chars | 20 XP (maximum per message) |
+| Mode | Command | Currency |
+|---|---|---|
+| Staked | `/bj bet:<amount>` | Gold 💰 |
+| Free Play | `/bj` | Tokens 🎟️ (1 token per game) |
 
-The bot ignores its own messages to prevent infinite loops.
+#### Lobby
 
-**Level thresholds (0–99):** XP required to advance from level `n` to `n+1`:
-
-```
-xp_to_next(n) = 5·n² + 50·n + 100
-```
-
-**XP is the primary currency.** Level is a cosmetic rank title that rises and falls with your XP. Losing XP in games can drop your level.
-
-**Clamping:** XP is always floored at 0 (cannot go negative). Tokens (free play) have no floor and can go negative.
-
----
-
-## Token System (Free Play)
-
-When playing `!bj` with no bet, a separate **token** currency is used instead of XP.
-
-- Each free play game uses a default bet of **1 token**
-- Tokens follow the same payout multipliers as staked games (Ban-Ban 3×, 5-Dragon 5×, etc.)
-- Tokens **can go negative** — no floor
-- Results embed shows each player's token delta and current balance after every game
-- `!tokens` — check your balance anytime
-- `!resettoken` — zero-out all token balances (anyone can run this)
-
----
-
-## Feature Spec: P2P Ban-Luck (Malaysian 21)
-
-### Multi-Player Lobby System
-
-Command: `!bj <bet>` — you become the **Banker (庄家)**.
-
-- Up to **4 other players** join by clicking the **Join** button (5 total at the table).
-- Banker can force-start early via **Start Game**; table auto-starts when full.
+- You open the lobby as the **Banker (庄家)**. Up to **4 other players** can join via the **🪑 Join** button (5 total at the table).
+- **🚪 Leave** — Players can leave the lobby before the game starts. The **banker** can also click Leave to **disband the entire lobby**.
+- **▶️ Start Game** — Banker force-starts early; table auto-starts when full.
 - Lobby expires after **2 minutes** if not started.
-- **Strict Escrow (资金冻结):** Banker's XP requirement = `bet × num_players × 6` (covers the 6× maximum payout for every player).
-- Players must have at least `bet` XP to join.
+- If the banker opens a staked lobby with ≤ 0 Gold, a public debt warning is shown.
+- If a player joins while in debt, a private **Continue / Cancel** confirmation is shown before they are added.
 
-### Custom Rules & Mechanics (Ban-Luck Logic)
+#### Gameplay
+
+- 2 hidden cards are dealt to everyone. Each player receives a private (ephemeral) message with their starting hand.
+- Players take turns sequentially: **Hit**, **Stand**, or **Escape**. Banker plays last.
+- **🃏 My Cards** — Sends a private message with your current hand and a rendered card image (available at any time).
+- **🔄 Refresh** — Reposts the game board at the bottom of the chat and fully resets the 5-minute button timer.
+- After every Hit, the bot sends you an ephemeral with your updated hand.
+- The public board keeps all cards hidden (`[?]`) until the final reveal.
+
+#### Rules
 
 **Dynamic Ace Value:**
 
@@ -112,40 +97,82 @@ Command: `!bj <bet>` — you become the **Banker (庄家)**.
 | 3 cards | 1 or 10 |
 | 4 or 5 cards | 1 only |
 
-**Minimum 16 Rule:** Any player or banker with < 16 points **must Hit**. The Stand button returns an error if points < 16 (bypassed for special hands).
+**Minimum 16 Rule:** Any player or banker with < 16 points **must Hit**. The Stand button shows an error if points < 16 (bypassed for special hands).
 
-**15/16 Escape (Surrender):** On the initial 2-card deal, if the hand exactly equals 15 or 16, a **🏃 Escape (走)** button appears. Clicking it refunds the bet and removes the player from the current round.
+**15/16 Escape (走):** On the initial 2-card deal, if the hand exactly equals 15 or 16, a **🏃 Escape** button appears. Clicking it refunds the bet and removes the player from the round.
 
-### Turn Order
+#### Special Hands & Payout Multipliers
 
-- 2 hidden cards dealt to everyone. On deal, each player automatically receives an ephemeral message — *only you can see this* — with their starting hand.
-- Players take turns sequentially (Hit / Stand / Escape). Banker plays last.
-- **My Cards** sends a fresh ephemeral with full hand + rendered card image.
-- After every Hit, the bot automatically sends an ephemeral with your updated hand.
-- Public board always shows all cards hidden (`[?]`) until reveal. Player scores are never shown publicly.
-- If a player busts (> 21), they lose immediately and their turn ends.
-- A new message is sent to ping the player when it becomes their turn.
-- Once all players are done, the Banker plays. Banker's final hand is compared against all surviving players.
-
-### Special Hands & Payout Model
-
-| Name | Trigger | Payout |
+| Name | Trigger | Multiplier |
 |---|---|---|
-| Ban-Ban 双A ✨ | Two Aces on initial 2-card deal | 3× |
-| Ban-Luck 过海 🌊 | Ace + (10, J, Q, K) on initial deal | 2× |
-| Double 双对子 👯 | Two identical ranks on initial deal (e.g. 8-8) | 2× |
-| 五龙 Five Dragon 🐲 | 5 cards without busting | 5× (economy cap) |
-| 7-7-7 三条七 🎰 | Three 7s totalling 21 | 5× (economy cap) |
-| Normal Win | Higher points than banker without busting | 1× |
+| Ban-Ban 双A ✨ | Two Aces on initial deal | 3× |
+| Ban-Luck 过海 🌊 | Ace + (10/J/Q/K) on initial deal | 2× |
+| Double 双对子 👯 | Two identical ranks on initial deal | 2× |
+| 五龙 Five Dragon 🐲 | 5 cards without busting | 5× |
+| 7-7-7 三条七 🎰 | Three 7s totalling 21 | 5× |
+| Normal Win | Higher score than banker (no bust) | 1× |
 
-**Clash Rule (神仙打架):** If both banker and player have special hands, the higher multiplier wins. Equal multipliers → Push (refund).
+**Clash Rule (神仙打架):** If both banker and player have special hands, the higher multiplier wins. Equal multipliers → Push (bet refunded).
 
-- Each player-banker pair is settled independently.
-- Payouts drawn from banker's frozen escrow. Remaining escrow returned to banker.
+The banker can go into debt to cover payouts — no escrow check blocks the game from starting.
 
-### Rematch
+#### Rematch
 
-After every game, a **🔄 Rematch** button appears. All previous participants must click it to agree. Once unanimous, a new game auto-starts with a randomly selected eligible banker (must have enough XP for escrow).
+After every game a **🔄 Rematch** button appears. All previous participants must click it to agree. Once unanimous, a new game starts with a randomly selected banker.
+
+---
+
+### Heads or Tails — `!ht`
+
+| Mode | Command | Currency |
+|---|---|---|
+| Staked | `/ht choice:<h\|t> bet:<amount>` | Gold 💰 |
+| Free Play | `/ht choice:<h\|t>` | Tokens 🎟️ (1 token per flip) |
+
+- Win: receive 1× your bet. Lose: lose your bet.
+- If playing staked with ≤ 0 Gold, a **Continue / Cancel** confirmation is shown before the flip.
+- Debt interest (30%) applies to winnings if you were in debt at the start.
+
+---
+
+### Slot Machine — `/slots`
+
+```
+/slots bet:100
+```
+
+- Bet must be a positive integer. Uses Gold 💰 only (no free play mode).
+- A **3×3 emoji grid** is generated: 🍒 🍋 🍉 🔔 💎 🎰
+- Only the **middle row** determines the outcome.
+- A spinning animation `[ 🔄 | 🔄 | 🔄 ]` shows for 1.5 seconds, then the grid is revealed.
+
+**Payout Multipliers:**
+
+| Middle Row | Multiplier |
+|---|---|
+| 🎰 🎰 🎰 | **50×** — JACKPOT!! MASSIVE WIN! |
+| 💎 💎 💎 | **20×** — MEGA WIN! |
+| Any other 3 identical | **10×** — BIG WIN! |
+| Any 2 identical | **1×** — Push (bet returned, no profit) |
+| All different | **0** — Lose |
+
+- If your Gold balance is ≤ 0 when running `/slots`, a **Continue / Cancel** confirmation is shown.
+- Debt interest (30%) applies to winnings if you were in debt at the start.
+
+---
+
+## Token System (Free Play)
+
+Used by `!bj` (no bet) and `!ht <h|t>` (no bet). Tracks a separate balance per user.
+
+| Command | Description |
+|---|---|
+| `/tokens [user]` | Check your (or someone else's) token balance |
+| `/resettoken` | Reset **all** token balances to 0 |
+
+- Default bet: **1 token** per game
+- Tokens can go **negative** (no floor)
+- Payout multipliers are the same as staked games
 
 ---
 
@@ -179,19 +206,26 @@ discord bot/
 
 ---
 
-## Roadmap
+## Feature Changelog
 
-- [x] XP tracking per user (character-based, anti-spam)
-- [x] Level system (0–99) with progressive XP thresholds and rank titles
-- [x] `!level` command — show XP balance, rank, and level progress
-- [x] `!ht` minigame — wager XP on a coin flip (`h`/`t` shorthand)
-- [x] Persist XP to database (survive restarts)
-- [x] **P2P Ban-Luck** — Lobby system (banker + up to 4 players)
-- [x] **P2P Ban-Luck** — Dynamic Ace, must-hit-16, 15/16 Escape
-- [x] **P2P Ban-Luck** — Special hands (Ban-Ban, Ban-Luck, Double, 五龙, 7-7-7)
-- [x] **P2P Ban-Luck** — Ephemeral card images + strict 6× escrow
-- [x] **P2P Ban-Luck** — Rematch system (unanimous vote, random banker)
-- [x] **Free Play mode** — token system (can go negative, `!tokens`, `!resettoken`)
+- [x] Gold economy system (guild-specific, replaces XP)
+- [x] `/daily` — 300 Gold every 24 hours
+- [x] `/balance` — check own or another user's Gold
+- [x] `/leaderboard` — top 10 richest per server
+- [x] Debt system — negative Gold allowed, 30% interest on winnings
+- [x] Debt confirmation gate (Continue / Cancel) for all staked games
+- [x] **Ban-Luck** — staked (Gold) and free play (tokens) modes
+- [x] **Ban-Luck** — dynamic Ace, must-hit-16, 15/16 Escape
+- [x] **Ban-Luck** — special hands (Ban-Ban, Ban-Luck, Double, 五龙, 7-7-7)
+- [x] **Ban-Luck** — ephemeral card images per player
+- [x] **Ban-Luck** — game board always at bottom (delete + resend on every action)
+- [x] **Ban-Luck** — 🔄 Refresh button resets 5-minute interaction timer
+- [x] **Ban-Luck** — 🚪 Leave button (players leave; banker disbands lobby)
+- [x] **Ban-Luck** — banker can go into debt (no escrow block)
+- [x] **Ban-Luck** — Rematch system (unanimous vote, random banker)
+- [x] **Heads or Tails** — staked (Gold) and free play (tokens) modes
+- [x] **Slot Machine** (`/slots`) — 3×3 grid, 50×/20×/10×/1× multipliers, spinning animation
+- [x] Token system — `/tokens`, `/resettoken`
+- [x] All commands migrated to Discord slash commands (`/`) with autocomplete descriptions
+- [x] `/disclaimer` — legal disclaimer (no gambling, tokens have no value, no real-money purchase/withdrawal)
 - [x] Deploy 24/7 on Koyeb + Supabase
-- [ ] XP cooldown (rate limit per user)
-- [ ] `!leaderboard` — top users by XP or tokens

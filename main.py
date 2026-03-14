@@ -1,21 +1,26 @@
 """
-Discord Bot MVP
----------------
+Discord Bot
+-----------
 Features:
-  - XP earned per message is based on character count (anti-spam)
-  - XP accumulates and unlocks Levels (0–99); Level ≠ XP
-  - !level       → show caller's Level, current XP, and XP needed for next level
-  - !cointoss    → wager XP on a 50/50 coin flip
-  - !blackjack   → challenge another user to P2P Blackjack
+  - Gold economy (guild-specific, debt allowed)
+  - /daily        → claim 300 Gold once every 24 hours
+  - /balance      → check Gold balance (self or @user)
+  - /leaderboard  → top 10 richest players in the server
+  - /ht           → wager Gold on a 50/50 coin flip
+  - /bj           → Malaysian Ban-Luck (21)
+  - /slots        → 3×3 slot machine
 """
 
 import asyncio
+import datetime
+import math
 import os
 import random
 import sqlite3
 import discord
 from discord.ext import commands
-from discord import ui
+from discord import app_commands, ui
+from typing import Literal
 from dotenv import load_dotenv
 from blackjack import GameTable, PlayerState
 from card_renderer import render_hand_image
@@ -27,88 +32,34 @@ from card_renderer import render_hand_image
 load_dotenv()
 TOKEN: str = os.getenv("DISCORD_TOKEN")
 
-MAX_LEVEL: int = 99
+DAILY_REWARD:        int   = 300   # Gold awarded by !daily
+DEBT_TAX_RATE:       float = 0.30  # 30% tax on net winnings when in debt
+FREE_PLAY_TOKEN_BET: int   = 1     # token bet size in free-play mode
 
-# XP awarded per message: capped to prevent walls-of-text abuse.
-# Formula: 1 XP per 5 characters, minimum 1, maximum 20.
-# e.g. "hi" (2 chars) → 1 XP | "hello world" (11 chars) → 2 XP | 100+ chars → 20 XP
-XP_PER_CHAR_DIVISOR: int = 5
-XP_MIN_PER_MSG: int = 1
-XP_MAX_PER_MSG: int = 20
-
-# Rank titles assigned by level bracket — purely cosmetic.
-# Level is just a badge; XP balance is what actually matters for betting.
-RANK_TITLES: list[tuple[int, str]] = [
-    (99, "👑 Legend"),
-    (80, "💎 Diamond"),
-    (60, "🏅 Platinum"),
-    (40, "🥇 Gold"),
-    (20, "🥈 Silver"),
-    (10, "🥉 Bronze"),
-    (0,  "🌱 Rookie"),
-]
-
-def rank_title(level: int) -> str:
-    """Return the cosmetic rank title for a given level."""
-    for threshold, title in RANK_TITLES:
-        if level >= threshold:
-            return title
-    return RANK_TITLES[-1][1]
-
-
-# ---------------------------------------------------------------------------
-# Level Threshold Table  (precomputed at startup — read-only after that)
-# ---------------------------------------------------------------------------
-# Formula for XP required to advance FROM level n TO level n+1:
-#   xp_to_next(n) = 5·n² + 50·n + 100
-#
-# This is the same curve used by many popular Discord bots (e.g. MEE6).
-# At low levels it's quick; at high levels it demands real engagement.
-#
-# LEVEL_XP_TABLE[n] = total cumulative XP needed to *reach* level n.
-#   LEVEL_XP_TABLE[0] = 0   (you start at level 0)
-#   LEVEL_XP_TABLE[1] = 100
-#   LEVEL_XP_TABLE[2] = 255  (100 + 155)
-#   LEVEL_XP_TABLE[99] ≈ 170 700
-#
-# Think of this as a sorted lookup table — same pattern as a calibration
-# table in firmware where you binary-search for the right range.
-
-def _xp_to_next(level: int) -> int:
-    """XP required to advance from `level` to `level + 1`."""
-    return 5 * (level ** 2) + 50 * level + 100
-
-LEVEL_XP_TABLE: list[int] = [0]
-for _lvl in range(MAX_LEVEL):
-    LEVEL_XP_TABLE.append(LEVEL_XP_TABLE[-1] + _xp_to_next(_lvl))
-# LEVEL_XP_TABLE now has MAX_LEVEL+1 entries (indices 0 … 99)
-
+DEBT_WARNING = (
+    "⚠️ You are gambling on borrowed Gold! "
+    "If you win, **30% interest** will be deducted from your profits! "
+    "Run out of Gold? Use `/daily` to claim your daily relief fund!"
+)
 
 # ---------------------------------------------------------------------------
 # Database  (PostgreSQL in cloud via Supabase, SQLite for local dev)
 # ---------------------------------------------------------------------------
-# Set DATABASE_URL env var in Koyeb to use PostgreSQL.
-# Leave it unset locally and SQLite is used automatically — no config needed.
-#
-# Schema: one table, one row per user.
-#   user_id — Discord snowflake (64-bit integer)
-#   xp      — current XP balance (floored at 0)
 
 DATABASE_URL: str | None = os.environ.get("DATABASE_URL")
 
 if DATABASE_URL:
-    # ── Cloud: PostgreSQL (Supabase) ─────────────────────────────────────
     import psycopg2
 
     class _DB:
         """
-        Thin psycopg2 wrapper that mimics the sqlite3 connection API
-        (execute + fetchone, commit).  Auto-reconnects on dropped connections.
+        Thin psycopg2 wrapper that mimics the sqlite3 connection API.
         Translates SQLite-style '?' placeholders to PostgreSQL '%s'.
+        Auto-reconnects on dropped connections.
         """
 
         def __init__(self, url: str) -> None:
-            self._url = url
+            self._url  = url
             self._conn = self._connect()
 
         def _connect(self):
@@ -117,7 +68,7 @@ if DATABASE_URL:
             return conn
 
         def execute(self, sql: str, params: tuple = ()):
-            sql = sql.replace("?", "%s")   # SQLite → PostgreSQL placeholder
+            sql = sql.replace("?", "%s")
             for attempt in range(2):
                 try:
                     cur = self._conn.cursor()
@@ -133,32 +84,28 @@ if DATABASE_URL:
             self._conn.commit()
 
     db = _DB(DATABASE_URL)
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS user_xp (
-            user_id  BIGINT  PRIMARY KEY,
-            xp       INTEGER NOT NULL DEFAULT 0
-        )
-    """)
-    db.commit()
     print("[DB] Connected → PostgreSQL (Supabase)")
 
 else:
-    # ── Local: SQLite ────────────────────────────────────────────────────
     DB_PATH: str = os.environ.get(
         "DB_PATH",
         os.path.join(os.path.dirname(__file__), "bot_data.db"),
     )
     db = sqlite3.connect(DB_PATH, check_same_thread=False)
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS user_xp (
-            user_id  INTEGER PRIMARY KEY,
-            xp       INTEGER NOT NULL DEFAULT 0
-        )
-    """)
-    db.commit()
     print(f"[DB] Connected → {DB_PATH}")
 
-# Tokens table — shared between both DB backends (BIGINT is valid in SQLite too)
+# user_gold: guild-specific Gold balances (debt allowed — no floor)
+db.execute("""
+    CREATE TABLE IF NOT EXISTS user_gold (
+        guild_id   BIGINT  NOT NULL,
+        user_id    BIGINT  NOT NULL,
+        gold       INTEGER NOT NULL DEFAULT 0,
+        last_daily TEXT,
+        PRIMARY KEY (guild_id, user_id)
+    )
+""")
+
+# user_tokens: free-play token balances (global, not guild-specific)
 db.execute("""
     CREATE TABLE IF NOT EXISTS user_tokens (
         user_id  BIGINT  PRIMARY KEY,
@@ -169,42 +116,51 @@ db.commit()
 
 
 # ---------------------------------------------------------------------------
-# Bot / Intent Setup
-# ---------------------------------------------------------------------------
-intents = discord.Intents.default()
-intents.message_content = True     # Required to read message text
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-
-# ---------------------------------------------------------------------------
-# Pure helper functions  (no side-effects — easy to unit-test)
+# Gold helpers  (guild-specific; no floor — negative balance / debt allowed)
 # ---------------------------------------------------------------------------
 
-def get_total_xp(user_id: int) -> int:
-    """Read total XP from DB, returning 0 for first-time users."""
+def get_gold(guild_id: int, user_id: int) -> int:
+    """Return the player's current Gold balance in this guild (0 for first-timers)."""
     row = db.execute(
-        "SELECT xp FROM user_xp WHERE user_id = ?", (user_id,)
+        "SELECT gold FROM user_gold WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id),
     ).fetchone()
     return row[0] if row else 0
 
 
-def add_xp(user_id: int, amount: int) -> None:
+def add_gold(guild_id: int, user_id: int, amount: int) -> int:
     """
-    Upsert XP for a user (INSERT or UPDATE on conflict).
-    XP is always clamped to >= 0 before writing.
-
-    INSERT … ON CONFLICT … DO UPDATE is the SQLite equivalent of
-    a read-modify-write with a single atomic statement — no separate
-    SELECT needed, no race condition.
+    Add (or subtract) Gold for a player in this guild.
+    No floor — balance may go negative (debt).
+    Returns the new balance.
     """
-    new_xp = max(0, get_total_xp(user_id) + amount)
+    new_val = get_gold(guild_id, user_id) + amount
     db.execute(
         """
-        INSERT INTO user_xp (user_id, xp) VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET xp = excluded.xp
+        INSERT INTO user_gold (guild_id, user_id, gold) VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, user_id) DO UPDATE SET gold = excluded.gold
         """,
-        (user_id, new_xp),
+        (guild_id, user_id, new_val),
+    )
+    db.commit()
+    return new_val
+
+
+def get_last_daily(guild_id: int, user_id: int) -> str | None:
+    row = db.execute(
+        "SELECT last_daily FROM user_gold WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def set_last_daily(guild_id: int, user_id: int, ts: str) -> None:
+    db.execute(
+        """
+        INSERT INTO user_gold (guild_id, user_id, gold, last_daily) VALUES (?, ?, 0, ?)
+        ON CONFLICT(guild_id, user_id) DO UPDATE SET last_daily = excluded.last_daily
+        """,
+        (guild_id, user_id, ts),
     )
     db.commit()
 
@@ -213,11 +169,7 @@ def add_xp(user_id: int, amount: int) -> None:
 # Token helpers  (free-play only; no floor — can go negative)
 # ---------------------------------------------------------------------------
 
-FREE_PLAY_TOKEN_BET: int = 1   # default bet size for every free-play game
-
-
 def get_tokens(user_id: int) -> int:
-    """Return the player's current token balance (0 for first-timers)."""
     row = db.execute(
         "SELECT tokens FROM user_tokens WHERE user_id = ?", (user_id,)
     ).fetchone()
@@ -225,7 +177,6 @@ def get_tokens(user_id: int) -> int:
 
 
 def add_tokens(user_id: int, amount: int) -> None:
-    """Upsert token balance — no floor, may go negative."""
     new_val = get_tokens(user_id) + amount
     db.execute(
         """
@@ -238,49 +189,18 @@ def add_tokens(user_id: int, amount: int) -> None:
 
 
 def reset_all_tokens() -> None:
-    """Zero-out every row in the tokens table."""
     db.execute("UPDATE user_tokens SET tokens = 0")
     db.commit()
 
 
-def level_from_xp(total_xp: int) -> int:
-    """
-    Derive the current level from total XP via a linear scan of the table.
-    Returns a value clamped to [0, MAX_LEVEL].
+# ---------------------------------------------------------------------------
+# Bot / Intent Setup
+# ---------------------------------------------------------------------------
 
-    Equivalent to: find the highest index n such that LEVEL_XP_TABLE[n] <= total_xp.
-    """
-    level = 0
-    for n in range(MAX_LEVEL + 1):
-        if total_xp >= LEVEL_XP_TABLE[n]:
-            level = n
-        else:
-            break
-    return level
+intents = discord.Intents.default()
+intents.message_content = True
 
-
-def xp_progress(total_xp: int) -> tuple[int, int, int]:
-    """
-    Returns a 3-tuple describing progress within the current level:
-      (current_level, xp_earned_in_this_level, xp_needed_for_next_level)
-
-    At MAX_LEVEL, xp_earned and xp_needed are both 0 (no next level exists).
-    """
-    lvl = level_from_xp(total_xp)
-    if lvl >= MAX_LEVEL:
-        return lvl, 0, 0
-    xp_start = LEVEL_XP_TABLE[lvl]
-    xp_end   = LEVEL_XP_TABLE[lvl + 1]
-    return lvl, total_xp - xp_start, xp_end - xp_start
-
-
-def xp_for_message(content: str) -> int:
-    """
-    Calculate XP to award for a message based on its character count.
-    Clamped to [XP_MIN_PER_MSG, XP_MAX_PER_MSG] to discourage spam.
-    """
-    char_count = len(content.strip())
-    return max(XP_MIN_PER_MSG, min(char_count // XP_PER_CHAR_DIVISOR, XP_MAX_PER_MSG))
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 # ---------------------------------------------------------------------------
@@ -288,12 +208,6 @@ def xp_for_message(content: str) -> int:
 # ---------------------------------------------------------------------------
 
 async def _start_health_server() -> None:
-    """
-    Tiny HTTP server that answers GET / with "OK".
-    - Koyeb requires an open port to confirm the service is running.
-    - UptimeRobot pings this URL every 5 minutes to prevent auto-sleep.
-    Port is read from the PORT env var (set automatically by Koyeb).
-    """
     from aiohttp import web as _web
 
     port = int(os.environ.get("PORT", 8080))
@@ -318,188 +232,367 @@ async def _start_health_server() -> None:
 @bot.event
 async def on_ready() -> None:
     asyncio.create_task(_start_health_server())
+    await bot.tree.sync()
     print(f"[BOT] Logged in as {bot.user} (ID: {bot.user.id})")
-    print(f"[BOT] Level cap: {MAX_LEVEL} | XP to reach lv.99: {LEVEL_XP_TABLE[MAX_LEVEL]:,}")
-    print("[BOT] Ready. Listening for messages...")
+    print("[BOT] Ready. Slash commands synced.")
 
 
 # ---------------------------------------------------------------------------
-# Event: on_message  — XP accumulator (character-based)
+# Event: on_message
 # ---------------------------------------------------------------------------
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    """
-    ISR equivalent: fires on every visible message.
-
-    1. Guard — ignore bot messages (prevents feedback loops).
-    2. Award XP proportional to character count.
-    3. Forward to command dispatcher (mandatory; without this, !commands are deaf).
-    """
     if message.author.bot:
         return
-
-    xp_gained = xp_for_message(message.content)
-    add_xp(message.author.id, xp_gained)
-
     await bot.process_commands(message)
 
 
 # ---------------------------------------------------------------------------
-# Command: !level
+# Command: !daily
 # ---------------------------------------------------------------------------
 
-@bot.command(name="level")
-async def cmd_level(ctx: commands.Context) -> None:
-    """
-    Usage: !level
+@bot.tree.command(name="daily", description="Claim 300 Gold — once every 24 hours")
+async def cmd_daily(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
 
-    XP balance is the primary number — it is your actual betting budget and
-    reflects wins/losses from gambling.  Level is a cosmetic rank title derived
-    from your current XP; it rises and falls with your balance.
-    """
-    total_xp              = get_total_xp(ctx.author.id)
-    lvl, xp_now, xp_next = xp_progress(total_xp)
-    title                 = rank_title(lvl)
+    guild_id = interaction.guild.id
+    uid      = interaction.user.id
+    now      = datetime.datetime.utcnow()
+    last_str = get_last_daily(guild_id, uid)
+
+    if last_str:
+        last_dt   = datetime.datetime.fromisoformat(last_str)
+        elapsed   = now - last_dt
+        cooldown  = datetime.timedelta(hours=24)
+        if elapsed < cooldown:
+            remaining  = cooldown - elapsed
+            total_secs = int(remaining.total_seconds())
+            hours, rem = divmod(total_secs, 3600)
+            minutes    = rem // 60
+            await interaction.response.send_message(
+                f"⏰ Already claimed! Come back in **{hours}h {minutes}m**.",
+                ephemeral=True,
+            )
+            return
+
+    new_bal = add_gold(guild_id, uid, DAILY_REWARD)
+    set_last_daily(guild_id, uid, now.isoformat())
+
+    color = discord.Color.green() if new_bal >= 0 else discord.Color.orange()
+    embed = discord.Embed(
+        title="🎁 Daily Reward",
+        description=f"{interaction.user.mention} claimed **{DAILY_REWARD:,} 💰**!",
+        color=color,
+    )
+    embed.add_field(name="New Balance", value=f"**{new_bal:,} 💰**", inline=False)
+    if new_bal < 0:
+        embed.set_footer(text="💸 Still in debt — keep grinding!")
+    await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# Command: !balance
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="balance", description="Check your own or another player's Gold balance")
+@app_commands.describe(member="The player to check — leave blank for yourself")
+async def cmd_balance(interaction: discord.Interaction, member: discord.Member = None) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    target = member or interaction.user
+    gold   = get_gold(interaction.guild.id, target.id)
+    color  = discord.Color.green() if gold >= 0 else discord.Color.red()
+    embed  = discord.Embed(
+        title=f"💰 {target.display_name}'s Balance",
+        description=f"**{gold:,} 💰**" + (" *(💸 In Debt!)*" if gold < 0 else ""),
+        color=color,
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# Command: !leaderboard
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="leaderboard", description="Top 10 richest players in this server")
+async def cmd_leaderboard(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    rows = db.execute(
+        "SELECT user_id, gold FROM user_gold WHERE guild_id = ? ORDER BY gold DESC LIMIT 10",
+        (interaction.guild.id,),
+    ).fetchall()
+
+    if not rows:
+        await interaction.followup.send("No Gold records yet in this server.")
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines  = []
+    for i, (uid, gold) in enumerate(rows):
+        # get_member only hits the cache; fetch_member makes an API call for misses
+        member = interaction.guild.get_member(uid)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(uid)
+            except (discord.NotFound, discord.HTTPException):
+                member = None
+        name  = member.display_name if member else f"Unknown User ({uid})"
+        medal = medals[i] if i < 3 else f"**{i + 1}.**"
+        sign  = "+" if gold > 0 else ""
+        lines.append(f"{medal} **{name}** — {sign}{gold:,} 💰")
 
     embed = discord.Embed(
-        title=f"{ctx.author.display_name}",
+        title=f"🏆 {interaction.guild.name} Leaderboard",
+        description="\n".join(lines),
         color=discord.Color.gold(),
     )
+    await interaction.followup.send(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# Command: /disclaimer
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="disclaimer", description="Legal disclaimer — game tokens, no real money")
+async def cmd_disclaimer(interaction: discord.Interaction) -> None:
+    embed = discord.Embed(
+        title="⚠️ Legal Disclaimer",
+        color=discord.Color.dark_grey(),
+    )
     embed.add_field(
-        name="💰 XP Balance",
-        value=f"**{total_xp:,} XP**  *(your betting budget)*",
+        name="Not Gambling",
+        value=(
+            "This bot provides **entertainment-only** games. "
+            "This is **not gambling** — no real money is involved."
+        ),
         inline=False,
     )
-
-    if lvl >= MAX_LEVEL:
-        embed.add_field(
-            name="🏆 Rank",
-            value=f"{title}  —  **Level {lvl} (MAX)**",
-            inline=False,
-        )
-    else:
-        filled  = round(xp_now / xp_next * 10) if xp_next else 10
-        bar     = "▓" * filled + "░" * (10 - filled)
-        pct     = round(xp_now / xp_next * 100) if xp_next else 100
-        embed.add_field(
-            name="📊 Rank",
-            value=f"{title}  —  **Level {lvl}**",
-            inline=True,
-        )
-        embed.add_field(
-            name=f"→ Level {lvl + 1}",
-            value=f"`[{bar}]` {pct}%\n{xp_now:,} / {xp_next:,} XP",
-            inline=True,
-        )
-
-    await ctx.send(embed=embed)
+    embed.add_field(
+        name="Gold & Tokens",
+        value=(
+            "**Gold** 💰 and **Tokens** 🪙 are **game tokens only**. "
+            "They have **no monetary value** and cannot be exchanged for real currency. "
+            "There is **no real-money purchase** system — you cannot buy Gold or Tokens with cash. "
+            "There is **no real-money withdrawal** — you cannot cash out or convert tokens to money."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Stay Away from Illegal Gambling",
+        value=(
+            "We encourage everyone to **stay away from illegal gambling**. "
+            "If you or someone you know struggles with gambling addiction, please seek help. "
+            "For support, visit: [BeGambleAware.org](https://www.begambleaware.org/) | "
+            "[Gamblers Anonymous](https://www.gamblersanonymous.org/)"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="No Liability",
+        value=(
+            "This bot is provided \"as is\" for entertainment purposes. "
+            "The developers assume no liability for any misuse or misunderstanding. "
+            "By using this bot, you agree that you understand these terms."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="For entertainment only — no real money involved")
+    await interaction.response.send_message(embed=embed)
 
 
 # ---------------------------------------------------------------------------
-# Command: !cointoss
+# Debt Confirmation View — !ht
 # ---------------------------------------------------------------------------
 
-@bot.command(name="ht", aliases=["cointoss"])
+class HTDebtConfirmView(ui.View):
+    """
+    Shown when a player with ≤ 0 Gold uses !ht.
+    The coin is NOT flipped until they explicitly confirm.
+    """
+
+    def __init__(self, guild_id: int, uid: int, bet_amount: int, choice: str) -> None:
+        super().__init__(timeout=60)
+        self.guild_id   = guild_id
+        self.uid        = uid
+        self.bet_amount = bet_amount
+        self.choice     = choice
+        self.done       = False
+        self.message:   discord.Message | None = None
+
+    def _check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.uid and not self.done
+
+    @ui.button(label="▶️ Continue (30% interest applies)", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        if not self._check(interaction):
+            await interaction.response.send_message("This isn't your bet!", ephemeral=True)
+            return
+
+        self.done = True
+        self.stop()
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+
+        guild_id   = self.guild_id
+        uid        = self.uid
+        bet_amount = self.bet_amount
+        choice     = self.choice
+
+        add_gold(guild_id, uid, -bet_amount)
+        result = random.choice(("heads", "tails"))
+        won    = (result == choice)
+
+        if won:
+            tax        = math.ceil(bet_amount * DEBT_TAX_RATE)
+            net_profit = bet_amount - tax
+            add_gold(guild_id, uid, bet_amount + net_profit)
+            new_gold = get_gold(guild_id, uid)
+            outcome  = (
+                f"🪙 Coin landed **{result}** — you guessed right! "
+                f"+**{net_profit:,}** 💰 profit\n"
+                f"🏦 **{tax:,}** Gold interest deducted!\n"
+                f"Balance: **{new_gold:,} 💰**"
+            )
+        else:
+            new_gold = get_gold(guild_id, uid)
+            outcome  = (
+                f"🪙 Coin landed **{result}** — wrong guess. "
+                f"-**{bet_amount:,}** 💰\n"
+                f"Balance: **{new_gold:,} 💰**"
+            )
+            if new_gold <= 0:
+                outcome += "\n💸 Broke? Use `/daily` to claim your daily Gold!"
+
+        await interaction.response.edit_message(content=outcome, embed=None, view=self)
+
+    @ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        if not self._check(interaction):
+            await interaction.response.send_message("This isn't your bet!", ephemeral=True)
+            return
+
+        self.done = True
+        self.stop()
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(
+            content="❌ Bet cancelled — no Gold was deducted.", embed=None, view=self
+        )
+
+    async def on_timeout(self) -> None:
+        if self.done:
+            return
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        if self.message:
+            try:
+                await self.message.edit(
+                    content="⏰ Confirmation timed out — bet cancelled.", embed=None, view=self
+                )
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Command: !ht (Heads or Tails)
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="ht", description="Flip a coin — guess heads or tails")
+@app_commands.describe(
+    choice="Pick heads or tails",
+    bet="Gold to wager (leave blank or 0 for free play with tokens)",
+)
 async def cmd_cointoss(
-    ctx: commands.Context,
-    bet_amount: int,
-    choice: str,
+    interaction: discord.Interaction,
+    choice: Literal["heads", "tails"],
+    bet: int = 0,
 ) -> None:
-    """
-    Usage: !ht <bet_xp> <h|t>
-
-    Wagers <bet_xp> of the caller's total XP on a 50/50 coin flip.
-    Win  → +bet_xp  (may trigger level-up)
-    Lose → -bet_xp  (may trigger level-down; floored at 0)
-    """
-    uid      = ctx.author.id
-    total_xp = get_total_xp(uid)
-
-    # --- Input validation (check bounds before touching state) --------------
-
-    choice = choice.lower()
-    # Normalise shorthand: h → heads, t → tails
-    if choice == "h":
-        choice = "heads"
-    elif choice == "t":
-        choice = "tails"
-
-    if choice not in ("heads", "tails"):
-        await ctx.send(f"Invalid choice. Use `h` (heads) or `t` (tails).")
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
         return
 
-    if bet_amount <= 0:
-        await ctx.send("Bet amount must be greater than 0.")
+    guild_id   = interaction.guild.id
+    uid        = interaction.user.id
+    free_play  = (bet == 0)
+    bet_amount = bet
+
+    if not free_play and bet_amount <= 0:
+        await interaction.response.send_message("Bet amount must be greater than 0.", ephemeral=True)
         return
 
-    if bet_amount > total_xp:
-        await ctx.send(
-            f"Not enough XP! You wagered **{bet_amount}** but only have **{total_xp}** XP."
+    # ── Free Play (tokens) ────────────────────────────────────────────────────
+    if free_play:
+        add_tokens(uid, -FREE_PLAY_TOKEN_BET)
+        result = random.choice(("heads", "tails"))
+        won    = (result == choice)
+
+        if won:
+            add_tokens(uid, FREE_PLAY_TOKEN_BET * 2)
+        new_bal = get_tokens(uid)
+        outcome = (
+            f"🪙 Coin landed **{result}** — "
+            + (f"you guessed right! +**1** 🪙" if won else "wrong guess. -**1** 🪙")
+            + f"\n🎮 Token Balance: **{new_bal:,} 🪙**"
         )
+        await interaction.response.send_message(outcome)
         return
 
-    # --- Coin flip ----------------------------------------------------------
+    # ── Staked (Gold) ─────────────────────────────────────────────────────────
+    gold_before = get_gold(guild_id, uid)
+    in_debt     = gold_before <= 0
 
+    if in_debt:
+        # Show warning embed with Continue / Cancel buttons — do NOT flip yet
+        embed = discord.Embed(
+            title="⚠️ You're in Debt!",
+            description=DEBT_WARNING,
+            color=discord.Color.red(),
+        )
+        embed.add_field(name="Current Balance", value=f"**{gold_before:,} 💰**", inline=True)
+        embed.add_field(name="Bet", value=f"**{bet_amount:,} 💰** on **{choice}**", inline=True)
+        view = HTDebtConfirmView(guild_id, uid, bet_amount, choice)
+        await interaction.response.send_message(embed=embed, view=view)
+        msg = await interaction.original_response()
+        view.message = msg
+        return
+
+    # No debt — execute flip immediately
+    add_gold(guild_id, uid, -bet_amount)
     result: str = random.choice(("heads", "tails"))
     won: bool   = (result == choice)
 
-    # --- State update -------------------------------------------------------
-
-    lvl_before = level_from_xp(total_xp)
-
     if won:
-        add_xp(uid, +bet_amount)
-    else:
-        add_xp(uid, -bet_amount)    # add_xp clamps total XP to 0
-
-    new_total_xp = get_total_xp(uid)
-    lvl_after, xp_now, xp_next = xp_progress(new_total_xp)
-
-    # Build outcome message
-    outcome_line = (
-        f"🪙 Coin landed **{result}** — you guessed right! +**{bet_amount}** XP."
-        if won else
-        f"🪙 Coin landed **{result}** — wrong guess. -**{bet_amount}** XP."
-    )
-
-    # Append level change annotation if level shifted
-    if lvl_after > lvl_before:
-        level_line = f"⬆️ Level up! You are now **Level {lvl_after}**."
-    elif lvl_after < lvl_before:
-        level_line = f"⬇️ Level down. You are now **Level {lvl_after}**."
-    else:
-        if lvl_after >= MAX_LEVEL:
-            level_line = f"Level **{lvl_after}** *(MAX)* | Total XP: **{new_total_xp:,}**"
-        else:
-            level_line = f"Level **{lvl_after}** | XP: **{xp_now}** / **{xp_next}**"
-
-    await ctx.send(f"{outcome_line}\n{level_line}")
-
-
-# ---------------------------------------------------------------------------
-# Error handler for !cointoss bad arguments
-# ---------------------------------------------------------------------------
-
-@cmd_cointoss.error
-async def cointoss_error(ctx: commands.Context, error: commands.CommandError) -> None:
-    if isinstance(error, commands.BadArgument):
-        await ctx.send(
-            "Bad arguments. Usage: `!ht <bet_xp> <h|t>`\n"
-            "Example: `!ht 50 h`"
+        add_gold(guild_id, uid, bet_amount * 2)
+        new_gold = get_gold(guild_id, uid)
+        outcome  = (
+            f"🪙 Coin landed **{result}** — you guessed right! +**{bet_amount:,}** 💰 profit\n"
+            f"Balance: **{new_gold:,} 💰**"
         )
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("Missing arguments. Usage: `!ht <bet_xp> <h|t>`")
     else:
-        raise error
+        new_gold = get_gold(guild_id, uid)
+        outcome  = (
+            f"🪙 Coin landed **{result}** — wrong guess. -**{bet_amount:,}** 💰\n"
+            f"Balance: **{new_gold:,} 💰**"
+        )
+        if new_gold <= 0:
+            outcome += "\n💸 Broke? Use `/daily` to claim your daily Gold!"
+
+    await interaction.response.send_message(outcome)
 
 
 # ---------------------------------------------------------------------------
-# Blackjack — In-Memory Game State
+# Ban-Luck — In-Memory Game State
 # ---------------------------------------------------------------------------
-# active_tables:     banker_id → GameTable  (one entry per open/running game)
-# active_player_ids: all user IDs currently in a lobby or live game
-#   Acts as a mutex — prevents anyone from joining two games at once.
 
 active_tables:     dict[int, GameTable] = {}
 active_player_ids: set[int]             = set()
@@ -522,23 +615,20 @@ def _calc_payout(
     bet:    int,
 ) -> tuple[int, str]:
     """
-    Calculate XP returned to a single player after the game ends.
+    Calculate Gold returned to a single player after the game ends.
     The player's bet was already deducted at game start.
 
-    Ban-Luck payout rules:
-      0       → full loss
-      bet     → push / refund
-      bet * 2 → normal win
-      special → bet * multiplier (2x / 3x / 5x depending on hand)
+    Return value (payout) semantics:
+      payout > bet  → player won
+      payout == bet → push (stake returned)
+      payout == 0   → player lost their bet
+      payout < 0    → player owes extra (banker had a special; payout = -(extra))
 
-    Clash Rule: both player AND banker have specials → higher multiplier wins;
-      equal multipliers → push.
+    Debt interest is NOT applied here — caller handles it via _apply_debt_tax().
     """
-    # Escaped players are handled separately in resolve_table (skipped here)
     p_hand = player.hand
     b_hand = banker.hand
 
-    # Bust always loses
     if p_hand.is_bust:
         return 0, "💥 Bust — lost"
 
@@ -550,34 +640,47 @@ def _calc_payout(
         p_mult = p_special[1]
         b_mult = b_special[1]
         if p_mult > b_mult:
-            # Total return = stake back + multiplier × bet
             payout = int(bet * (1 + p_mult))
-            return payout, f"🏆 Clash! {p_special[0]} beats {b_special[0]} — **+{payout - bet}** XP"
+            return payout, f"🏆 Clash! {p_special[0]} beats {b_special[0]} — **+{payout - bet:,}** 💰"
         if b_mult > p_mult:
-            return 0, f"❌ Clash! {b_special[0]} beats {p_special[0]} — lost"
-        return bet, f"🤝 Clash! Equal specials — push"
+            extra = int(bet * (b_mult - 1))
+            return -extra, f"❌ Clash! {b_special[0]} beats {p_special[0]} — lost **{int(b_mult)}x**"
+        return bet, "🤝 Clash! Equal specials — push"
 
     # Only player has special
     if p_special:
-        # Total return = stake back + multiplier × bet
-        # e.g. 2x Ban-Luck → +2×bet profit → get back bet + 2×bet = 3×bet total
         payout = int(bet * (1 + p_special[1]))
-        return payout, f"🏆 {p_special[0]} — **+{payout - bet}** XP"
+        return payout, f"🏆 {p_special[0]} — **+{payout - bet:,}** 💰"
 
-    # Only banker has special → player loses
+    # Only banker has special — banker's multiplier applies;
+    # player owes (mult × bet) total; they already paid 1× at game start.
     if b_special:
-        return 0, f"❌ Banker has {b_special[0]} — lost"
+        mult  = b_special[1]
+        extra = int(bet * (mult - 1))
+        return -extra, f"❌ Banker has {b_special[0]} — lost **{int(mult)}x**"
 
-    # Banker bust (neither has special)
     if b_hand.is_bust:
         return bet * 2, "🏆 Banker busted — won"
 
-    # Normal score comparison
     if p_hand.score > b_hand.score:
         return bet * 2, f"🏆 Won ({p_hand.score} vs {b_hand.score})"
     if p_hand.score < b_hand.score:
         return 0, f"❌ Lost ({p_hand.score} vs {b_hand.score})"
     return bet, f"🤝 Push ({p_hand.score} each)"
+
+
+def _apply_debt_tax(payout: int, bet: int, desc: str) -> tuple[int, str]:
+    """
+    Apply 30% ceiling tax on net profit for an in-debt player.
+    Only modifies payout when net_profit > 0 (player actually won).
+    Returns (adjusted_payout, updated_description).
+    """
+    net_profit = payout - bet
+    if net_profit <= 0:
+        return payout, desc
+    tax      = math.ceil(net_profit * DEBT_TAX_RATE)
+    adjusted = payout - tax
+    return adjusted, desc + f"\n  🏦 **{tax:,}** Gold interest deducted!"
 
 
 def _cleanup_table(table: GameTable) -> None:
@@ -588,8 +691,7 @@ def _cleanup_table(table: GameTable) -> None:
 async def _ping_turn(interaction: discord.Interaction, table: GameTable) -> None:
     """
     Send a NEW (non-ephemeral) channel message pinging the current player.
-    A fresh message is required so Discord actually notifies them —
-    editing an existing message does NOT trigger a ping.
+    A fresh message is required so Discord actually notifies them.
     """
     current = table.current_participant
     if current is None or table.phase != "playing":
@@ -599,6 +701,81 @@ async def _ping_turn(interaction: discord.Interaction, table: GameTable) -> None
     await interaction.followup.send(
         f"▶️ <@{current.user_id}>{role} it's your turn!", ephemeral=False
     )
+
+
+# ---------------------------------------------------------------------------
+# Ban-Luck — Shared Payout Settlement Helpers
+# ---------------------------------------------------------------------------
+
+def _settle_staked(table: GameTable) -> tuple[list[str], int]:
+    """
+    Settle all player payouts for a Gold-staked game.
+    Applies 30% debt tax for in-debt players who won.
+    Escaped players' bets were already refunded in GameView.escape — skip them.
+
+    Returns (result_lines, banker_net).
+    banker_net is used by the caller to compute: banker_total = escrow + banker_net.
+    """
+    banker     = table.banker
+    banker_net = 0
+    lines: list[str] = []
+
+    for player in table.players:
+        if player.escaped:
+            lines.append(f"**{player.name}**: 🏃 Escaped (bet refunded)")
+            # bet was already returned in GameView.escape — do not add_gold again
+            continue
+
+        payout, desc    = _calc_payout(player, banker, table.bet)
+        original_payout = payout   # banker settles on the pre-tax amount
+
+        if player.in_debt:
+            payout, desc = _apply_debt_tax(payout, table.bet, desc)
+
+        add_gold(table.guild_id, player.user_id, payout)
+        lines.append(f"**{player.name}**: {desc}")
+        # Banker's profit/loss is based on the original (pre-tax) payout;
+        # the tax is a house take that exits the economy.
+        banker_net += (table.bet - original_payout)
+
+    return lines, banker_net
+
+
+def _settle_free_play(table: GameTable) -> tuple[list[str], list[str]]:
+    """
+    Settle all player payouts for a free-play (token) game.
+    No Gold changes, no debt tax.
+
+    Returns (result_lines, token_balance_lines).
+    """
+    banker         = table.banker
+    tok_banker_net = 0
+    lines:     list[str] = []
+    tok_lines: list[str] = []
+
+    for player in table.players:
+        if player.escaped:
+            lines.append(f"**{player.name}**: 🏃 Escaped")
+            tok_lines.append(f"**{player.name}**: 🏃 Escaped")
+            continue
+
+        tok_ret, desc = _calc_payout(player, banker, FREE_PLAY_TOKEN_BET)
+        tok_delta     = tok_ret - FREE_PLAY_TOKEN_BET
+        add_tokens(player.user_id, tok_delta)
+        tok_banker_net -= tok_delta
+        sign    = "+" if tok_delta >= 0 else ""
+        new_bal = get_tokens(player.user_id)
+        lines.append(f"**{player.name}**: {desc}")
+        tok_lines.append(f"**{player.name}**: {sign}{tok_delta:,} 🪙 → **{new_bal:,}**")
+
+    add_tokens(table.banker_id, tok_banker_net)
+    b_sign = "+" if tok_banker_net >= 0 else ""
+    b_bal  = get_tokens(table.banker_id)
+    lines.append(f"**{banker.name} (Banker)**: Net **{b_sign}{tok_banker_net:,}** tokens")
+    tok_lines.append(
+        f"**{banker.name} (Banker)**: {b_sign}{tok_banker_net:,} 🪙 → **{b_bal:,}**"
+    )
+    return lines, tok_lines
 
 
 # ---------------------------------------------------------------------------
@@ -612,11 +789,11 @@ def build_lobby_embed(table: GameTable) -> discord.Embed:
     free_play = table.bet == 0
 
     if free_play:
-        stakes_line = "🎮 **Free Play** (no XP wagered)"
+        stakes_line = "🎮 **Free Play** (no Gold wagered)"
     else:
         stakes_line = (
-            f"Bet: **{table.bet} XP** each  |  "
-            f"Banker escrow: **{table.banker_escrow} XP** (covers 6× max payout)"
+            f"Bet: **{table.bet:,} 💰** each  |  "
+            f"Banker escrow: **{table.banker_escrow:,} 💰** (covers 6× max payout)"
         )
 
     embed = discord.Embed(
@@ -637,14 +814,16 @@ def build_lobby_embed(table: GameTable) -> discord.Embed:
 
 def build_board_embed(table: GameTable, *, reveal: bool = False) -> discord.Embed:
     """
-    Public game board. First card hidden per player while in progress.
-    Players see their own full hand + card image via 🃏 My Cards (ephemeral).
+    Public game board. Cards are hidden while in progress.
+    Players see their own full hand via 🃏 My Cards (ephemeral).
     """
     free_play = table.bet == 0
     embed = discord.Embed(
         title="🃏  Ban-Luck" + (" — Free Play 🎮" if free_play else ""),
-        description="🎮 No XP wagered" if free_play else f"Bet: **{table.bet} XP** each",
-        color=discord.Color.gold() if reveal else (discord.Color.teal() if free_play else discord.Color.green()),
+        description="🎮 No Gold wagered" if free_play else f"Bet: **{table.bet:,} 💰** each",
+        color=discord.Color.gold() if reveal else (
+            discord.Color.teal() if free_play else discord.Color.green()
+        ),
     )
 
     current = table.current_participant
@@ -667,7 +846,7 @@ def build_board_embed(table: GameTable, *, reveal: bool = False) -> discord.Embe
 
     if not reveal and table.phase == "playing" and current:
         embed.set_footer(
-            text=f"▶️ {current.name}'s turn  |  Bet: {table.bet} XP each"
+            text=f"▶️ {current.name}'s turn  |  Bet: {table.bet:,} 💰 each"
         )
     return embed
 
@@ -677,76 +856,37 @@ def build_board_embed(table: GameTable, *, reveal: bool = False) -> discord.Embe
 # ---------------------------------------------------------------------------
 
 async def resolve_table(
-    table:     GameTable,
-    game_view: "GameView",
+    table:       GameTable,
+    game_view:   "GameView",
     interaction: discord.Interaction,
 ) -> None:
     """
-    Calculate payouts, update SQLite, then:
+    Calculate payouts, update Gold/tokens, then:
       1. Edit the board message to reveal all cards with disabled buttons.
-      2. Send a NEW channel message with the full result breakdown +
-         a mention for every participant so they get notified.
+      2. Send a NEW channel message with the full result breakdown.
       3. Attach a RematchView to the results message.
-
-    Escrow model (zero-sum):
-      Banker deducted bet × num_players × 5 at start (5× coverage).
-      banker_return = banker_escrow + sum(bet - xp_ret) for non-escaped players.
     """
     table.phase = "finished"
     banker      = table.banker
-    banker_net  = 0
     free_play   = table.bet == 0
-    lines: list[str] = []
 
     if free_play:
-        # ── Free play: settle tokens (no XP changes) ────────────────────────
-        tok_banker_net = 0
-        tok_lines: list[str] = []
-        for player in table.players:
-            if player.escaped:
-                lines.append(f"**{player.name}**: 🏃 Escaped")
-                tok_lines.append(f"**{player.name}**: 🏃 Escaped")
-                continue
-            tok_ret, desc = _calc_payout(player, banker, FREE_PLAY_TOKEN_BET)
-            tok_delta     = tok_ret - FREE_PLAY_TOKEN_BET
-            add_tokens(player.user_id, tok_delta)
-            tok_banker_net -= tok_delta
-            sign = "+" if tok_delta >= 0 else ""
-            new_bal = get_tokens(player.user_id)
-            lines.append(f"**{player.name}**: {desc}")
-            tok_lines.append(
-                f"**{player.name}**: {sign}{tok_delta:,} 🪙 → **{new_bal:,}**"
-            )
-        add_tokens(table.banker_id, tok_banker_net)
-        b_sign = "+" if tok_banker_net >= 0 else ""
-        b_bal  = get_tokens(table.banker_id)
-        lines.append(f"**{banker.name} (Banker)**: Net **{b_sign}{tok_banker_net:,}** tokens")
-        tok_lines.append(
-            f"**{banker.name} (Banker)**: {b_sign}{tok_banker_net:,} 🪙 → **{b_bal:,}**"
-        )
+        lines, tok_lines = _settle_free_play(table)
     else:
-        # ── Staked play: settle XP ───────────────────────────────────────────
+        lines, banker_net = _settle_staked(table)
+        banker_total      = table.banker_escrow + banker_net
+        add_gold(table.guild_id, table.banker_id, max(0, banker_total))
+        net_str = f"+{banker_net:,}" if banker_net >= 0 else f"{banker_net:,}"
+        lines.append(f"**{banker.name} (Banker)**: Net **{net_str}** 💰")
         tok_lines = None
-        for player in table.players:
-            if player.escaped:
-                lines.append(f"**{player.name}**: 🏃 Escaped (bet refunded)")
-                continue
-            xp_ret, desc = _calc_payout(player, banker, table.bet)
-            add_xp(player.user_id, xp_ret)
-            lines.append(f"**{player.name}**: {desc}")
-            banker_net += (table.bet - xp_ret)
-        banker_total = table.banker_escrow + banker_net
-        add_xp(table.banker_id, max(0, banker_total))
-        net_str = f"+{banker_net}" if banker_net >= 0 else str(banker_net)
-        lines.append(f"**{banker.name} (Banker)**: Net **{net_str}** XP")
 
-    # ── 1. Edit board to reveal cards; disable all buttons ──────────────────
+    # Edit board to reveal cards + disable all buttons
     board_embed = build_board_embed(table, reveal=True)
     for item in game_view.children:
         item.disabled = True  # type: ignore[attr-defined]
     await interaction.response.edit_message(content="", embed=board_embed, view=game_view)
 
-    # ── 2. New channel message with results + everyone mentioned ────────────
+    # New channel message with results + everyone mentioned
     all_mentions = " ".join(f"<@{p.user_id}>" for p in table.all_participants)
     result_embed = discord.Embed(
         title="🏁  Game Over — Results",
@@ -759,15 +899,18 @@ async def resolve_table(
             value="\n".join(tok_lines),
             inline=False,
         )
-        result_embed.set_footer(text=f"Free Play — bet {FREE_PLAY_TOKEN_BET} tokens each | use !tokens to check balance")
+        result_embed.set_footer(
+            text=f"Free Play — bet {FREE_PLAY_TOKEN_BET} tokens each | use !tokens to check balance"
+        )
     else:
-        result_embed.set_footer(text=f"Bet: {table.bet} XP each")
+        result_embed.set_footer(text=f"Bet: {table.bet:,} 💰 each")
 
-    # ── 3. Rematch button ────────────────────────────────────────────────────
-    participants  = [(p.user_id, p.name) for p in table.all_participants]
-    rematch_view  = RematchView(bet=table.bet, participants=participants)
+    participants = [(p.user_id, p.name) for p in table.all_participants]
+    rematch_view = RematchView(
+        bet=table.bet, guild_id=table.guild_id, participants=participants
+    )
 
-    _cleanup_table(table)   # clean up BEFORE sending so players can re-join immediately
+    _cleanup_table(table)
     await interaction.followup.send(embed=result_embed, view=rematch_view, ephemeral=False)
 
 
@@ -805,9 +948,6 @@ class GameView(ui.View):
 
         special = current.hand.special
 
-        # Auto-end conditions: bust or triggered 五龙 / 7-7-7
-        # (Ban-Luck / Ban-Ban / Double only trigger on initial 2-card deal,
-        #  so those won't appear here after a Hit adds a 3rd card)
         auto_end = current.hand.is_bust or (
             special is not None
             and not any(kw in special[0] for kw in ("Ban-Luck", "Ban-Ban", "Double"))
@@ -834,14 +974,17 @@ class GameView(ui.View):
                 nxt = table.current_participant
                 tag = "💥 Bust" if current.hand.is_bust else f"🏅 {special[0] if special else 'Auto-stand'}"
                 embed.set_footer(text=f"{tag} — {current.name}  |  Now: {nxt.name if nxt else '?'}")
-            # Edit board WITHOUT content — edits don't trigger pings
-            await interaction.response.edit_message(content="", embed=embed, view=self)
-            # Only ping when the turn actually moved to someone new (bust / special auto-stand).
-            # If the same player is still going (e.g. hit 16→18, turn continues), stay silent.
+            # Defer, delete old board, resend at bottom so players never scroll up
+            await interaction.response.defer()
+            if self.message:
+                try:
+                    await self.message.delete()
+                except Exception:
+                    pass
+            self.message = await interaction.channel.send(embed=embed, view=self)
             if auto_end:
                 await _ping_turn(interaction, table)
 
-        # Ephemeral card image — only you can see this
         buf = await render_hand_image(current.hand)
         if buf:
             await interaction.followup.send(
@@ -863,9 +1006,6 @@ class GameView(ui.View):
             await interaction.response.send_message("It's not your turn!", ephemeral=True)
             return
 
-        # Minimum 16 Rule — cannot stand below 16,
-        # UNLESS the player already holds a special hand (e.g. Double 3-3).
-        # Forcing them to hit would only risk busting and losing the special payout.
         if current.hand.must_hit and not current.hand.special:
             await interaction.response.send_message(
                 f"❌ You must Hit — your score is **{current.hand.score}** (minimum 16 required).",
@@ -884,7 +1024,13 @@ class GameView(ui.View):
             embed.set_footer(
                 text=f"✋ {current.name} stands  |  Now: {nxt.name if nxt else '?'}"
             )
-            await interaction.response.edit_message(content="", embed=embed, view=self)
+            await interaction.response.defer()
+            if self.message:
+                try:
+                    await self.message.delete()
+                except Exception:
+                    pass
+            self.message = await interaction.channel.send(embed=embed, view=self)
             await _ping_turn(interaction, table)
 
     # --- Escape (🏃 走) — only on initial 2-card deal with 15 or 16 ---------
@@ -909,7 +1055,7 @@ class GameView(ui.View):
             return
 
         # Refund bet and mark as escaped
-        add_xp(current.user_id, table.bet)
+        add_gold(table.guild_id, current.user_id, table.bet)
         current.escaped = True
         should_resolve  = table.advance()
 
@@ -921,7 +1067,13 @@ class GameView(ui.View):
             embed.set_footer(
                 text=f"🏃 {current.name} escaped (bet refunded)  |  Now: {nxt.name if nxt else '?'}"
             )
-            await interaction.response.edit_message(content="", embed=embed, view=self)
+            await interaction.response.defer()
+            if self.message:
+                try:
+                    await self.message.delete()
+                except Exception:
+                    pass
+            self.message = await interaction.channel.send(embed=embed, view=self)
             await _ping_turn(interaction, table)
 
     # --- My Cards (ephemeral — only you can see this) -----------------------
@@ -953,6 +1105,39 @@ class GameView(ui.View):
         else:
             await interaction.response.send_message(content, ephemeral=True)
 
+    # --- Refresh (repost board + reset 5-min button timer) ------------------
+
+    @ui.button(label="🔄 Refresh", style=discord.ButtonStyle.grey)
+    async def refresh(
+        self, interaction: discord.Interaction, button: ui.Button
+    ) -> None:
+        table = self.table
+        uid   = interaction.user.id
+
+        if table.phase == "finished":
+            await interaction.response.send_message("This game has already ended.", ephemeral=True)
+            return
+
+        if not any(p.user_id == uid for p in table.all_participants):
+            await interaction.response.send_message("You're not in this game.", ephemeral=True)
+            return
+
+        # Create a fresh GameView so the 5-minute button timeout resets
+        new_view         = GameView(table)
+        new_view.message = None
+        self.stop()  # cancel old view's timeout (won't trigger on_timeout)
+
+        await interaction.response.defer()
+        if self.message:
+            try:
+                await self.message.delete()
+            except Exception:
+                pass
+
+        new_view.message = await interaction.channel.send(
+            embed=build_board_embed(table), view=new_view
+        )
+
     # --- Timeout ------------------------------------------------------------
 
     async def on_timeout(self) -> None:
@@ -963,9 +1148,9 @@ class GameView(ui.View):
 
         table.phase = "finished"
         for p in table.players:
-            if not p.escaped:   # escaped players were already refunded
-                add_xp(p.user_id, table.bet)
-        add_xp(table.banker_id, table.banker_escrow)
+            if not p.escaped:
+                add_gold(table.guild_id, p.user_id, table.bet)
+        add_gold(table.guild_id, table.banker_id, table.banker_escrow)
 
         for item in self.children:
             item.disabled = True  # type: ignore[attr-defined]
@@ -984,17 +1169,19 @@ class GameView(ui.View):
 class RematchView(ui.View):
     """
     All previous participants must click Rematch before anything happens.
-    Once the last vote is cast the game auto-starts:
-      - Banker is randomly chosen from those with enough escrow XP.
-      - Everyone is auto-joined (no separate lobby needed).
-      - Each player receives their starting hand via ephemeral (using the
-        interactions stored when they clicked Rematch).
+    Once the last vote is cast the game auto-starts with a randomly chosen banker.
     """
 
-    def __init__(self, bet: int, participants: list[tuple[int, str]]) -> None:
-        super().__init__(timeout=120)   # 2 minutes to gather all votes
+    def __init__(
+        self,
+        bet:          int,
+        guild_id:     int,
+        participants: list[tuple[int, str]],
+    ) -> None:
+        super().__init__(timeout=120)
         self.bet             = bet
-        self.participants    = participants      # [(user_id, display_name), ...]
+        self.guild_id        = guild_id
+        self.participants    = participants
         self.participant_set = {uid for uid, _ in participants}
         self.votes:         set[int]                       = set()
         self.interactions:  dict[int, discord.Interaction] = {}
@@ -1007,7 +1194,6 @@ class RematchView(ui.View):
         uid   = interaction.user.id
         total = len(self.participants)
 
-        # Guard: only original participants may vote
         if uid not in self.participant_set:
             await interaction.response.send_message(
                 "Only players from the previous game can vote for rematch.", ephemeral=True
@@ -1032,13 +1218,11 @@ class RematchView(ui.View):
             )
             return
 
-        # Record vote and store interaction for later ephemeral hand reveal
         self.votes.add(uid)
         self.interactions[uid] = interaction
         count = len(self.votes)
         button.label = f"🔄 Rematch ({count}/{total})"
 
-        # ── Not all in yet — show who's still missing ────────────────────────
         if count < total:
             waiting = [name for uid2, name in self.participants if uid2 not in self.votes]
             await interaction.response.edit_message(
@@ -1047,54 +1231,56 @@ class RematchView(ui.View):
             )
             return
 
-        # ── All voted — start the game ───────────────────────────────────────
-        self.started = True
+        # All voted — start the game
+        self.started    = True
         button.disabled = True
         self.stop()
 
-        # Escrow needed if this person becomes banker (worst-case: all others join)
-        num_others    = total - 1
-        escrow_needed = self.bet * num_others * 6  # 0 in free-play mode
+        num_others = total - 1
 
+        # Anyone who isn't already in another game can be the banker — debt is allowed
         eligible = [
             (uid2, name)
             for uid2, name in self.participants
             if uid2 not in active_player_ids
-            and (escrow_needed == 0 or get_total_xp(uid2) >= escrow_needed)
         ]
         if not eligible:
             await interaction.response.edit_message(
-                content=(
-                    f"❌ Rematch cancelled — nobody has enough XP to be banker.\n"
-                    f"(Need **{escrow_needed} XP** to cover the 6× escrow for {num_others} players.)"
-                ),
+                content="❌ Rematch cancelled — all players are already in another game.",
                 embed=None, view=None,
             )
             return
 
         banker_id, banker_name = random.choice(eligible)
 
-        # Build table and auto-add all other voters
-        table = GameTable(banker_id=banker_id, banker_name=banker_name, bet=self.bet)
+        table = GameTable(
+            guild_id=self.guild_id,
+            banker_id=banker_id,
+            banker_name=banker_name,
+            bet=self.bet,
+        )
         for uid2, name in self.participants:
             if uid2 != banker_id and uid2 not in active_player_ids:
                 table.add_player(uid2, name)
 
-        # Register active state
         active_tables[banker_id] = table
         for p in table.all_participants:
             active_player_ids.add(p.user_id)
 
-        # Deduct bets
+        # Debt check BEFORE deducting bets
+        debt_players: list[PlayerState] = []
         for p in table.players:
-            add_xp(p.user_id, -table.bet)
-        add_xp(banker_id, -table.banker_escrow)
+            if get_gold(self.guild_id, p.user_id) <= 0:
+                p.in_debt = True
+                debt_players.append(p)
 
-        # Deal cards
+        for p in table.players:
+            add_gold(self.guild_id, p.user_id, -table.bet)
+        add_gold(self.guild_id, banker_id, -table.banker_escrow)
+
         table.start()
         game_view = GameView(table)
 
-        # Edit the results message into the new game board
         board_embed = build_board_embed(table)
         await interaction.response.edit_message(
             content=f"🔄 **Rematch!** New banker: **{banker_name}**",
@@ -1103,7 +1289,18 @@ class RematchView(ui.View):
         )
         game_view.message = interaction.message
 
-        # Send each player their starting hand via their stored Rematch interaction
+        # Debt warnings (public)
+        for p in debt_players:
+            stored = self.interactions.get(p.user_id)
+            if stored:
+                try:
+                    await stored.followup.send(
+                        f"<@{p.user_id}> {DEBT_WARNING}", ephemeral=False
+                    )
+                except Exception:
+                    pass
+
+        # Send each player their starting hand as an ephemeral
         for p in table.all_participants:
             stored = self.interactions.get(p.user_id)
             if stored is None:
@@ -1118,9 +1315,8 @@ class RematchView(ui.View):
                 else:
                     await stored.followup.send(hand_txt, ephemeral=True)
             except Exception:
-                pass  # Interaction expired — silently skip
+                pass
 
-        # Ping the first player
         first = table.current_participant
         if first:
             await interaction.followup.send(
@@ -1128,8 +1324,100 @@ class RematchView(ui.View):
             )
 
     async def on_timeout(self) -> None:
-        """If not everyone voted in time, disable the button silently."""
         if self.started:
+            return
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Debt Confirmation View — !bj Join
+# ---------------------------------------------------------------------------
+
+class BjDebtConfirmView(ui.View):
+    """
+    Shown (ephemeral) when a player with ≤ 0 Gold tries to join a staked lobby.
+    They must explicitly confirm before being added to the table.
+    """
+
+    def __init__(self, lobby_view: "LobbyView", uid: int, name: str) -> None:
+        super().__init__(timeout=60)
+        self.lobby_view = lobby_view
+        self.uid        = uid
+        self.name       = name
+        self.done       = False
+
+    def _check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.uid and not self.done
+
+    @ui.button(label="▶️ Continue (30% interest applies)", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        if not self._check(interaction):
+            await interaction.response.send_message("This isn't your confirmation!", ephemeral=True)
+            return
+
+        self.done = True
+        self.stop()
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        # Acknowledge the button press (disables the buttons in the ephemeral)
+        await interaction.response.edit_message(view=self)
+
+        lv    = self.lobby_view
+        table = lv.table
+        uid   = self.uid
+
+        if uid in active_player_ids:
+            await interaction.followup.send("You're already in a game or lobby.", ephemeral=True)
+            return
+
+        if not table.add_player(uid, self.name):
+            await interaction.followup.send(
+                "Can't join — table is full or game already started.", ephemeral=True
+            )
+            return
+
+        active_player_ids.add(uid)
+        # Store THIS interaction so the game start can send the ephemeral card reveal
+        lv.interactions[uid] = interaction
+
+        if table.is_full:
+            # interaction.response is already used — can't call _launch_game which
+            # needs a fresh response to edit the lobby message.
+            # Instead update the lobby message directly and ask the banker to start.
+            if lv.message:
+                try:
+                    await lv.message.edit(embed=build_lobby_embed(table), view=lv)
+                except Exception:
+                    pass
+            await interaction.followup.send(
+                "✅ Joined! The table is now full — **banker, please click ▶️ Start Game**.",
+                ephemeral=True,
+            )
+        else:
+            if lv.message:
+                try:
+                    await lv.message.edit(embed=build_lobby_embed(table), view=lv)
+                except Exception:
+                    pass
+            await interaction.followup.send("✅ Joined the lobby!", ephemeral=True)
+
+    @ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        if not self._check(interaction):
+            await interaction.response.send_message("This isn't your confirmation!", ephemeral=True)
+            return
+
+        self.done = True
+        self.stop()
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(
+            content="❌ Cancelled — you did not join the lobby.", view=self
+        )
+
+    async def on_timeout(self) -> None:
+        if self.done:
             return
         for item in self.children:
             item.disabled = True  # type: ignore[attr-defined]
@@ -1151,10 +1439,6 @@ class LobbyView(ui.View):
         self.table        = table
         self.resolved     = False
         self.message: discord.Message | None = None
-        # Stores each participant's Discord interaction so we can send them
-        # a private ephemeral (only-you-can-see) when the game starts.
-        # Key = user_id.  Value = the interaction that was triggered when
-        # that player clicked Join (or the banker clicked Start Game).
         self.interactions: dict[int, discord.Interaction] = {}
 
     @ui.button(label="🪑 Join", style=discord.ButtonStyle.green)
@@ -1170,11 +1454,18 @@ class LobbyView(ui.View):
             )
             return
 
-        if table.bet > 0 and get_total_xp(uid) < table.bet:
-            await interaction.response.send_message(
-                f"Not enough XP to join! Need **{table.bet}**, you have **{get_total_xp(uid)}**.",
-                ephemeral=True,
+        # Debt gate: show confirm/cancel view before adding to the table
+        if table.bet > 0 and get_gold(table.guild_id, uid) <= 0:
+            gold_now = get_gold(table.guild_id, uid)
+            embed = discord.Embed(
+                title="⚠️ You're in Debt!",
+                description=DEBT_WARNING,
+                color=discord.Color.red(),
             )
+            embed.add_field(name="Current Balance", value=f"**{gold_now:,} 💰**", inline=True)
+            embed.add_field(name="Bet to join", value=f"**{table.bet:,} 💰**", inline=True)
+            confirm_view = BjDebtConfirmView(self, uid, interaction.user.display_name)
+            await interaction.response.send_message(embed=embed, view=confirm_view, ephemeral=True)
             return
 
         if not table.add_player(uid, interaction.user.display_name):
@@ -1184,7 +1475,6 @@ class LobbyView(ui.View):
             return
 
         active_player_ids.add(uid)
-        # Store interaction now; used later in _launch_game to send ephemeral hand reveal
         self.interactions[uid] = interaction
 
         if table.is_full:
@@ -1193,6 +1483,57 @@ class LobbyView(ui.View):
             await interaction.response.edit_message(
                 embed=build_lobby_embed(table), view=self
             )
+
+    @ui.button(label="🚪 Leave", style=discord.ButtonStyle.danger)
+    async def leave(
+        self, interaction: discord.Interaction, button: ui.Button
+    ) -> None:
+        table = self.table
+        uid   = interaction.user.id
+
+        # Banker disbands the whole lobby
+        if uid == table.banker_id:
+            if self.resolved:
+                await interaction.response.send_message(
+                    "The game has already started.", ephemeral=True
+                )
+                return
+
+            self.resolved = True
+            self.stop()
+            _cleanup_table(table)
+
+            for item in self.children:
+                item.disabled = True  # type: ignore[attr-defined]
+
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="🚪 Lobby Disbanded",
+                    description=f"**{interaction.user.display_name}** (banker) closed the lobby.",
+                    color=discord.Color.dark_grey(),
+                ),
+                view=self,
+            )
+            return
+
+        # Check the user is actually in this lobby
+        if not any(p.user_id == uid for p in table.players):
+            await interaction.response.send_message(
+                "You're not in this lobby.", ephemeral=True
+            )
+            return
+
+        # Remove from table and global tracking
+        table.players = [p for p in table.players if p.user_id != uid]
+        active_player_ids.discard(uid)
+        self.interactions.pop(uid, None)
+
+        await interaction.response.edit_message(
+            embed=build_lobby_embed(table), view=self
+        )
+        await interaction.followup.send(
+            f"👋 **{interaction.user.display_name}** left the lobby.", ephemeral=False
+        )
 
     @ui.button(label="▶️ Start Game", style=discord.ButtonStyle.primary)
     async def start_game(
@@ -1208,48 +1549,36 @@ class LobbyView(ui.View):
             )
             return
 
-        # Store banker's interaction so they also get the auto ephemeral on game start
         self.interactions[interaction.user.id] = interaction
         await self._launch_game(interaction)
 
     async def _launch_game(self, interaction: discord.Interaction) -> None:
         """
         LOBBY → PLAYING:
-        1. Validate banker has banker_escrow XP (bet × players × 5).
-        2. Deduct bets (players: bet each; banker: banker_escrow).
-        3. Deal 2 cards, position first active player.
-        4. Show game board.
+        1. Debt-check every player (and banker) before deducting — warn if ≤ 0.
+        2. Deduct bets + banker escrow (all parties may go into debt).
+        3. Deal 2 cards, show game board.
         """
         if self.resolved:
-            return
-
-        table         = self.table
-        banker_needed = table.banker_escrow   # 0 in free-play mode
-
-        # Escrow / XP validation only applies when there are real stakes
-        if banker_needed > 0 and get_total_xp(table.banker_id) < banker_needed:
-            for p in table.players:
-                active_player_ids.discard(p.user_id)
-            _cleanup_table(table)
-            self.resolved = True
-            self.stop()
-            await interaction.response.edit_message(
-                content=(
-                    f"❌ Game cancelled — banker **{table.banker_name}** doesn't have "
-                    f"enough XP for the 6× escrow "
-                    f"(needs **{banker_needed}**, has **{get_total_xp(table.banker_id)}**)."
-                ),
-                embed=None, view=None,
-            )
             return
 
         self.resolved = True
         self.stop()
 
+        table         = self.table
+        banker_needed = table.banker_escrow
+
+        # Debt check BEFORE deducting bets (only for staked games)
+        debt_players: list[PlayerState] = []
         if banker_needed > 0:
             for p in table.players:
-                add_xp(p.user_id, -table.bet)
-            add_xp(table.banker_id, -banker_needed)
+                if get_gold(table.guild_id, p.user_id) <= 0:
+                    p.in_debt = True
+                    debt_players.append(p)
+
+            for p in table.players:
+                add_gold(table.guild_id, p.user_id, -table.bet)
+            add_gold(table.guild_id, table.banker_id, -banker_needed)
 
         table.start()
         game_view = GameView(table)
@@ -1262,15 +1591,22 @@ class LobbyView(ui.View):
         await interaction.response.edit_message(content="", embed=embed, view=game_view)
         game_view.message = interaction.message
 
-        # ── Send each participant their starting hand as an ephemeral ────────
-        # We stored the Discord interaction for everyone who clicked Join, and
-        # the banker who clicked Start Game. Discord allows followup messages
-        # on a prior interaction for up to 15 minutes — well within the 2-min
-        # lobby window — so this always works.
+        # Debt warnings for in-debt players (public so everyone sees)
+        for p in debt_players:
+            stored = self.interactions.get(p.user_id)
+            if stored:
+                try:
+                    await stored.followup.send(
+                        f"<@{p.user_id}> {DEBT_WARNING}", ephemeral=False
+                    )
+                except Exception:
+                    pass
+
+        # Send each participant their starting hand as an ephemeral
         for p in table.all_participants:
             stored = self.interactions.get(p.user_id)
             if stored is None:
-                continue   # no interaction stored (e.g. banker on auto-start)
+                continue
             hand_txt = f"🃏 **Your starting hand:**\n{p.hand.show()}"
             buf = await render_hand_image(p.hand)
             try:
@@ -1281,9 +1617,8 @@ class LobbyView(ui.View):
                 else:
                     await stored.followup.send(hand_txt, ephemeral=True)
             except Exception:
-                pass  # Interaction expired — silently skip
+                pass
 
-        # ── If anyone has no stored interaction, tell them to click My Cards ─
         no_ix = [p for p in table.all_participants if p.user_id not in self.interactions]
         fallback_mentions = " ".join(f"<@{p.user_id}>" for p in no_ix)
         if fallback_mentions:
@@ -1292,7 +1627,6 @@ class LobbyView(ui.View):
                 ephemeral=False,
             )
 
-        # ── First turn ping (new message = real notification) ────────────────
         first = table.current_participant
         if first:
             await interaction.followup.send(
@@ -1301,50 +1635,23 @@ class LobbyView(ui.View):
 
     async def _resolve_immediate(
         self,
-        table:     GameTable,
-        game_view: "GameView",
+        table:       GameTable,
+        game_view:   "GameView",
         interaction: discord.Interaction,
     ) -> None:
         """Immediate resolution when all turns end on the deal (edge case)."""
-        banker     = table.banker
-        banker_net = 0
-        free_play  = table.bet == 0
-        lines: list[str] = []
+        banker    = table.banker
+        free_play = table.bet == 0
 
         if free_play:
-            tok_banker_net = 0
-            tok_lines: list[str] = []
-            for player in table.players:
-                if player.escaped:
-                    lines.append(f"**{player.name}**: 🏃 Escaped")
-                    tok_lines.append(f"**{player.name}**: 🏃 Escaped")
-                    continue
-                tok_ret, desc = _calc_payout(player, banker, FREE_PLAY_TOKEN_BET)
-                tok_delta = tok_ret - FREE_PLAY_TOKEN_BET
-                add_tokens(player.user_id, tok_delta)
-                tok_banker_net -= tok_delta
-                sign   = "+" if tok_delta >= 0 else ""
-                new_bal = get_tokens(player.user_id)
-                lines.append(f"**{player.name}**: {desc}")
-                tok_lines.append(f"**{player.name}**: {sign}{tok_delta:,} 🪙 → **{new_bal:,}**")
-            add_tokens(table.banker_id, tok_banker_net)
-            b_sign = "+" if tok_banker_net >= 0 else ""
-            b_bal  = get_tokens(table.banker_id)
-            lines.append(f"**{banker.name} (Banker)**: Net **{b_sign}{tok_banker_net:,}** tokens")
-            tok_lines.append(f"**{banker.name} (Banker)**: {b_sign}{tok_banker_net:,} 🪙 → **{b_bal:,}**")
+            lines, tok_lines = _settle_free_play(table)
         else:
+            lines, banker_net = _settle_staked(table)
+            banker_total      = table.banker_escrow + banker_net
+            add_gold(table.guild_id, table.banker_id, max(0, banker_total))
+            net_str = f"+{banker_net:,}" if banker_net >= 0 else f"{banker_net:,}"
+            lines.append(f"**{banker.name} (Banker)**: Net **{net_str}** 💰")
             tok_lines = None
-            for player in table.players:
-                if player.escaped:
-                    lines.append(f"**{player.name}**: 🏃 Escaped")
-                    continue
-                xp_ret, desc = _calc_payout(player, banker, table.bet)
-                add_xp(player.user_id, xp_ret)
-                lines.append(f"**{player.name}**: {desc}")
-                banker_net += (table.bet - xp_ret)
-            add_xp(table.banker_id, max(0, table.banker_escrow + banker_net))
-            net_str = f"+{banker_net}" if banker_net >= 0 else str(banker_net)
-            lines.append(f"**{banker.name} (Banker)**: Net **{net_str}** XP")
 
         board_embed = build_board_embed(table, reveal=True)
         for item in game_view.children:
@@ -1363,12 +1670,16 @@ class LobbyView(ui.View):
                 value="\n".join(tok_lines),
                 inline=False,
             )
-            result_embed.set_footer(text=f"Free Play — bet {FREE_PLAY_TOKEN_BET} tokens each | use !tokens to check balance")
+            result_embed.set_footer(
+                text=f"Free Play — bet {FREE_PLAY_TOKEN_BET} tokens each | use !tokens to check balance"
+            )
         else:
-            result_embed.set_footer(text=f"Bet: {table.bet} XP each")
+            result_embed.set_footer(text=f"Bet: {table.bet:,} 💰 each")
 
         participants = [(p.user_id, p.name) for p in table.all_participants]
-        rematch_view = RematchView(bet=table.bet, participants=participants)
+        rematch_view = RematchView(
+            bet=table.bet, guild_id=table.guild_id, participants=participants
+        )
 
         _cleanup_table(table)
         await interaction.followup.send(embed=result_embed, view=rematch_view, ephemeral=False)
@@ -1385,57 +1696,54 @@ class LobbyView(ui.View):
 
 
 # ---------------------------------------------------------------------------
-# Command: !banluck
+# Command: !bj
 # ---------------------------------------------------------------------------
 
-@bot.command(name="bj")
-async def cmd_bj(ctx: commands.Context, bet: int = 0) -> None:
-    """
-    Usage: !bj [bet]
+@bot.tree.command(name="bj", description="Open a Ban-Luck (21) lobby as banker")
+@app_commands.describe(bet="Gold bet per player (leave blank or 0 for free play with tokens)")
+async def cmd_bj(interaction: discord.Interaction, bet: int = 0) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
 
-    !bj        → Free Play mode (no XP wagered — just for fun)
-    !bj 100    → Stakes mode (bet 100 XP; banker escrow = bet × players × 6)
-
-    Opens a Malaysian Ban-Luck (21) lobby as the Banker (庄家).
-    Up to 4 players join by clicking the button.
-    """
-    uid  = ctx.author.id
-    name = ctx.author.display_name
+    uid      = interaction.user.id
+    name     = interaction.user.display_name
+    guild_id = interaction.guild.id
 
     if bet < 0:
-        await ctx.send("Bet cannot be negative. Use `!bj` for free play or `!bj <amount>` for stakes.")
-        return
-
-    if uid in active_player_ids:
-        await ctx.send("You already have an open lobby or are in a game.")
-        return
-
-    # Only check XP when there are real stakes; the escrow itself is
-    # validated at game-start (when the player count is known).
-    if bet > 0 and get_total_xp(uid) < bet:
-        await ctx.send(
-            f"Not enough XP to open a table! Need at least **{bet}** XP "
-            f"(you have **{get_total_xp(uid)}**).\n"
-            f"Note: the full escrow of **{bet} × players × 6** is deducted at game start."
+        await interaction.response.send_message(
+            "Bet cannot be negative. Use `/bj` for free play or `/bj <amount>` for stakes.",
+            ephemeral=True,
         )
         return
 
-    table = GameTable(banker_id=uid, banker_name=name, bet=bet)
+    if uid in active_player_ids:
+        await interaction.response.send_message(
+            "You already have an open lobby or are in a game.", ephemeral=True
+        )
+        return
+
+    table = GameTable(guild_id=guild_id, banker_id=uid, banker_name=name, bet=bet)
     active_tables[uid]   = table
     active_player_ids.add(uid)
 
     view = LobbyView(table)
-    msg  = await ctx.send(embed=build_lobby_embed(table), view=view)
+
+    # Warn banker if they're in debt (game still opens — debt is allowed)
+    if bet > 0 and get_gold(guild_id, uid) <= 0:
+        await interaction.response.send_message(f"<@{uid}> {DEBT_WARNING}")
+        msg = await interaction.followup.send(embed=build_lobby_embed(table), view=view)
+    else:
+        await interaction.response.send_message(embed=build_lobby_embed(table), view=view)
+        msg = await interaction.original_response()
+
     view.message = msg
 
 
-@bot.command(name="tokens")
-async def cmd_tokens(ctx: commands.Context, member: discord.Member = None) -> None:
-    """
-    !tokens          — show your own token balance
-    !tokens @someone — show that player's token balance
-    """
-    target = member or ctx.author
+@bot.tree.command(name="tokens", description="Check your free-play token balance")
+@app_commands.describe(member="The player to check — leave blank for yourself")
+async def cmd_tokens(interaction: discord.Interaction, member: discord.Member = None) -> None:
+    target = member or interaction.user
     bal    = get_tokens(target.id)
     sign   = "+" if bal > 0 else ""
     color  = discord.Color.green() if bal >= 0 else discord.Color.red()
@@ -1444,26 +1752,225 @@ async def cmd_tokens(ctx: commands.Context, member: discord.Member = None) -> No
         description=f"**{sign}{bal:,} tokens**",
         color=color,
     )
-    embed.set_footer(text="Earned via Free Play (!bj) | reset with !resettoken")
-    await ctx.send(embed=embed)
+    embed.set_footer(text="Earned via Free Play (/bj) | reset with /resettoken")
+    await interaction.response.send_message(embed=embed)
 
 
-@bot.command(name="resettoken")
-async def cmd_reset_token(ctx: commands.Context) -> None:
-    """Zero-out every player's token balance."""
+@bot.tree.command(name="resettoken", description="Reset all token balances to zero")
+async def cmd_reset_token(interaction: discord.Interaction) -> None:
     reset_all_tokens()
-    await ctx.send("✅ All token balances have been reset to **0**.")
+    await interaction.response.send_message("✅ All token balances have been reset to **0**.")
 
 
-@cmd_bj.error
-async def bj_error(ctx: commands.Context, error: commands.CommandError) -> None:
-    if isinstance(error, commands.BadArgument):
-        await ctx.send(
-            "Bad argument. Usage: `!bj` (free play) or `!bj <bet>` (with stakes)\n"
-            "Example: `!bj 50`"
+# ---------------------------------------------------------------------------
+# Slot Machine — helpers
+# ---------------------------------------------------------------------------
+
+SLOT_SYMBOLS: list[str] = ["🍒", "🍋", "🍉", "🔔", "💎", "🎰"]
+
+
+def _spin_grid() -> list[list[str]]:
+    """Generate a fresh 3×3 grid of random slot symbols."""
+    return [[random.choice(SLOT_SYMBOLS) for _ in range(3)] for _ in range(3)]
+
+
+def _calc_slots_payout(middle_row: list[str], bet: int) -> tuple[int, str]:
+    """
+    Evaluate the middle row and return (payout, description).
+    payout is the amount added back to the player's balance
+    (bet was already deducted, so net profit = payout - bet).
+    """
+    a, b, c = middle_row
+    if a == b == c:
+        if a == "🎰":
+            return bet * 50, "🎰 🎰 🎰  **JACKPOT!! MASSIVE WIN!** — **50×** payout!"
+        if a == "💎":
+            return bet * 20, "💎 💎 💎  **Diamond! MEGA WIN!** — **20×** payout!"
+        return bet * 10, f"{a} {a} {a}  **Three of a kind! BIG WIN!** — **10×** payout!"
+    if a == b or b == c or a == c:
+        return bet, "Two of a kind — bet returned."
+    return 0, "No match — lost."
+
+
+def _fmt_grid(grid: list[list[str]]) -> str:
+    """Render the 3×3 grid as a Discord-friendly string, marking the middle row."""
+    rows = []
+    for i, row in enumerate(grid):
+        line = "[ " + " | ".join(row) + " ]"
+        if i == 1:
+            line += "  ◄"
+        rows.append(line)
+    return "\n".join(rows)
+
+
+async def _run_slots(
+    channel,
+    guild_id: int,
+    uid:      int,
+    bet:      int,
+    in_debt:  bool,
+) -> None:
+    """
+    Core slot machine coroutine.
+    Assumes bet has already been deducted from the player's balance.
+    Sends spinning animation, waits 1.5 s, then edits to reveal result and settle.
+    """
+    spin_embed = discord.Embed(
+        title="🎰 Slot Machine",
+        description=(
+            "[ 🔄 | 🔄 | 🔄 ]\n"
+            "[ 🔄 | 🔄 | 🔄 ]  ◄\n"
+            "[ 🔄 | 🔄 | 🔄 ]\n\n"
+            "*Pulling the lever...*"
+        ),
+        color=discord.Color.orange(),
+    )
+    spin_embed.set_footer(text=f"Bet: {bet:,} 💰")
+    msg = await channel.send(embed=spin_embed)
+
+    await asyncio.sleep(1.5)
+
+    grid   = _spin_grid()
+    middle = grid[1]
+    payout, result_desc = _calc_slots_payout(middle, bet)
+    net = payout - bet
+
+    # Debt tax on net winnings
+    tax_line = ""
+    if in_debt and net > 0:
+        tax      = math.ceil(net * DEBT_TAX_RATE)
+        payout  -= tax
+        net      = payout - bet
+        tax_line = f"\n🏦 **{tax:,}** Gold interest deducted!"
+
+    add_gold(guild_id, uid, payout)
+    new_gold = get_gold(guild_id, uid)
+
+    color = (
+        discord.Color.gold()    if net > 0 else
+        discord.Color.blurple() if net == 0 else
+        discord.Color.red()
+    )
+    net_str = (
+        f"+**{net:,}** 💰"    if net > 0 else
+        "±**0** 💰"           if net == 0 else
+        f"-**{bet:,}** 💰"
+    )
+
+    result_embed = discord.Embed(
+        title="🎰 Slot Machine — Result",
+        description=_fmt_grid(grid),
+        color=color,
+    )
+    result_embed.add_field(name="Outcome", value=result_desc + tax_line, inline=False)
+    result_embed.add_field(name="Net",     value=net_str,                inline=True)
+    result_embed.add_field(name="Balance", value=f"**{new_gold:,} 💰**", inline=True)
+    if new_gold <= 0 and net < 0:
+        result_embed.set_footer(text="💸 Broke? Use !daily to claim your daily Gold!")
+
+    await msg.edit(embed=result_embed)
+
+
+# ---------------------------------------------------------------------------
+# Debt Confirmation View — !slots
+# ---------------------------------------------------------------------------
+
+class SlotsDebtConfirmView(ui.View):
+    """
+    Shown when a player with ≤ 0 Gold uses !slots.
+    The reels do NOT spin until they explicitly confirm.
+    """
+
+    def __init__(self, channel, guild_id: int, uid: int, bet: int) -> None:
+        super().__init__(timeout=60)
+        self.channel  = channel
+        self.guild_id = guild_id
+        self.uid      = uid
+        self.bet      = bet
+        self.done     = False
+        self.message: discord.Message | None = None
+
+    def _check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.uid and not self.done
+
+    @ui.button(label="▶️ Continue (30% interest applies)", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        if not self._check(interaction):
+            await interaction.response.send_message("This isn't your game!", ephemeral=True)
+            return
+        self.done = True
+        self.stop()
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(view=self)
+        add_gold(self.guild_id, self.uid, -self.bet)
+        await _run_slots(self.channel, self.guild_id, self.uid, self.bet, in_debt=True)
+
+    @ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        if not self._check(interaction):
+            await interaction.response.send_message("This isn't your game!", ephemeral=True)
+            return
+        self.done = True
+        self.stop()
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(
+            content="❌ Bet cancelled — no Gold was deducted.", embed=None, view=self
         )
-    else:
-        raise error
+
+    async def on_timeout(self) -> None:
+        if self.done:
+            return
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        if self.message:
+            try:
+                await self.message.edit(
+                    content="⏰ Confirmation timed out — bet cancelled.", embed=None, view=self
+                )
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Command: !slots
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="slots", description="Spin the slot machine — Gold bets only")
+@app_commands.describe(bet="Amount of Gold to wager (must be a positive integer)")
+async def cmd_slots(interaction: discord.Interaction, bet: int) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    if bet <= 0:
+        await interaction.response.send_message("Bet must be a positive integer.", ephemeral=True)
+        return
+
+    guild_id    = interaction.guild.id
+    uid         = interaction.user.id
+    gold_before = get_gold(guild_id, uid)
+    in_debt     = gold_before <= 0
+
+    if in_debt:
+        embed = discord.Embed(
+            title="⚠️ You're in Debt!",
+            description=DEBT_WARNING,
+            color=discord.Color.red(),
+        )
+        embed.add_field(name="Current Balance", value=f"**{gold_before:,} 💰**", inline=True)
+        embed.add_field(name="Bet",             value=f"**{bet:,} 💰**",          inline=True)
+        view = SlotsDebtConfirmView(interaction.channel, guild_id, uid, bet)
+        await interaction.response.send_message(embed=embed, view=view)
+        msg = await interaction.original_response()
+        view.message = msg
+        return
+
+    # No debt — deduct bet and spin immediately
+    await interaction.response.defer()
+    add_gold(guild_id, uid, -bet)
+    await _run_slots(interaction.channel, guild_id, uid, bet, in_debt=False)
 
 
 # ---------------------------------------------------------------------------
