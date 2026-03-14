@@ -400,14 +400,14 @@ async def cmd_level(ctx: commands.Context) -> None:
 # Command: !cointoss
 # ---------------------------------------------------------------------------
 
-@bot.command(name="cointoss")
+@bot.command(name="ht", aliases=["cointoss"])
 async def cmd_cointoss(
     ctx: commands.Context,
     bet_amount: int,
     choice: str,
 ) -> None:
     """
-    Usage: !cointoss <bet_xp> <heads|tails>
+    Usage: !ht <bet_xp> <h|t>
 
     Wagers <bet_xp> of the caller's total XP on a 50/50 coin flip.
     Win  → +bet_xp  (may trigger level-up)
@@ -419,8 +419,14 @@ async def cmd_cointoss(
     # --- Input validation (check bounds before touching state) --------------
 
     choice = choice.lower()
+    # Normalise shorthand: h → heads, t → tails
+    if choice == "h":
+        choice = "heads"
+    elif choice == "t":
+        choice = "tails"
+
     if choice not in ("heads", "tails"):
-        await ctx.send(f"Invalid choice **{choice}**. Pick `heads` or `tails`.")
+        await ctx.send(f"Invalid choice. Use `h` (heads) or `t` (tails).")
         return
 
     if bet_amount <= 0:
@@ -479,11 +485,11 @@ async def cmd_cointoss(
 async def cointoss_error(ctx: commands.Context, error: commands.CommandError) -> None:
     if isinstance(error, commands.BadArgument):
         await ctx.send(
-            "Bad arguments. Usage: `!cointoss <bet_xp> <heads|tails>`\n"
-            "Example: `!cointoss 50 heads`"
+            "Bad arguments. Usage: `!ht <bet_xp> <h|t>`\n"
+            "Example: `!ht 50 h`"
         )
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("Missing arguments. Usage: `!cointoss <bet_xp> <heads|tails>`")
+        await ctx.send("Missing arguments. Usage: `!ht <bet_xp> <h|t>`")
     else:
         raise error
 
