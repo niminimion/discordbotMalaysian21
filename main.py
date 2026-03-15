@@ -112,6 +112,22 @@ db.execute("""
         tokens   INTEGER NOT NULL DEFAULT 0
     )
 """)
+
+# user_slots_pity: per-guild slots spin count + which spin (1–5) is the guaranteed triple (random)
+db.execute("""
+    CREATE TABLE IF NOT EXISTS user_slots_pity (
+        guild_id       BIGINT  NOT NULL,
+        user_id        BIGINT  NOT NULL,
+        spin_count     INTEGER NOT NULL DEFAULT 0,
+        pity_trigger_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (guild_id, user_id)
+    )
+""")
+try:
+    db.execute("ALTER TABLE user_slots_pity ADD COLUMN pity_trigger_at INTEGER DEFAULT 0")
+    db.commit()
+except Exception:
+    pass
 db.commit()
 
 
@@ -190,6 +206,57 @@ def add_tokens(user_id: int, amount: int) -> None:
 
 def reset_all_tokens() -> None:
     db.execute("UPDATE user_tokens SET tokens = 0")
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Slots pity (guarantee 3-of-a-kind within first 5 spins for new players)
+# ---------------------------------------------------------------------------
+
+def get_slots_pity(guild_id: int, user_id: int) -> tuple[int, int]:
+    """Return (spin_count, pity_trigger_at). spin_count = completed spins; pity_trigger_at = 1–5 or 0 if not set."""
+    row = db.execute(
+        "SELECT spin_count, pity_trigger_at FROM user_slots_pity WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id),
+    ).fetchone()
+    if row is None:
+        return 0, 0
+    return row[0], row[1] or 0
+
+
+def ensure_pity_trigger_and_get(guild_id: int, user_id: int) -> tuple[int, int]:
+    """
+    If user is in first 5 spins and pity_trigger_at not set, set it to random 1–5 and save.
+    Return (spin_count, pity_trigger_at).
+    """
+    spin_count, pity_trigger_at = get_slots_pity(guild_id, user_id)
+    next_spin = spin_count + 1
+    if next_spin <= 5 and pity_trigger_at <= 0:
+        pity_trigger_at = random.randint(1, 5)
+        db.execute(
+            """
+            INSERT INTO user_slots_pity (guild_id, user_id, spin_count, pity_trigger_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET pity_trigger_at = excluded.pity_trigger_at
+            """,
+            (guild_id, user_id, spin_count, pity_trigger_at),
+        )
+        db.commit()
+    return spin_count, pity_trigger_at
+
+
+def update_slots_pity_after_spin(guild_id: int, user_id: int) -> None:
+    """Increment spin count after a spin."""
+    spin_count, pity_trigger_at = get_slots_pity(guild_id, user_id)
+    new_count = spin_count + 1
+    db.execute(
+        """
+        INSERT INTO user_slots_pity (guild_id, user_id, spin_count, pity_trigger_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id, user_id) DO UPDATE SET spin_count = excluded.spin_count
+        """,
+        (guild_id, user_id, new_count, pity_trigger_at or 0),
+    )
     db.commit()
 
 
@@ -1740,6 +1807,47 @@ async def cmd_bj(interaction: discord.Interaction, bet: int = 0) -> None:
     view.message = msg
 
 
+@bot.tree.command(name="leave", description="Leave your current Ban-Luck lobby as a player")
+async def cmd_leave(interaction: discord.Interaction) -> None:
+    """Slash command fallback: leave an open Ban-Luck lobby without pressing the button."""
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "This command can only be used in a server.", ephemeral=True
+        )
+        return
+
+    guild_id = interaction.guild.id
+    uid      = interaction.user.id
+
+    # Find a lobby in this guild where the user is a joined player (not banker)
+    target_table: GameTable | None = None
+    for table in active_tables.values():
+        if table.guild_id != guild_id:
+            continue
+        if table.phase != "lobby":
+            continue
+        if any(p.user_id == uid for p in table.players):
+            target_table = table
+            break
+
+    if target_table is None:
+        await interaction.response.send_message(
+            "You're not currently in any Ban-Luck lobby as a player.\n"
+            "If a game is already running, please finish the round.",
+            ephemeral=True,
+        )
+        return
+
+    # Remove from lobby and global tracking
+    target_table.players = [p for p in target_table.players if p.user_id != uid]
+    active_player_ids.discard(uid)
+
+    await interaction.response.send_message(
+        f"👋 **{interaction.user.display_name}** left the Ban-Luck lobby "
+        f"(banker: <@{target_table.banker_id}>, bet: {target_table.bet:,} 💰)."
+    )
+
+
 @bot.tree.command(name="tokens", description="Check your free-play token balance")
 @app_commands.describe(member="The player to check — leave blank for yourself")
 async def cmd_tokens(interaction: discord.Interaction, member: discord.Member = None) -> None:
@@ -1768,10 +1876,38 @@ async def cmd_reset_token(interaction: discord.Interaction) -> None:
 
 SLOT_SYMBOLS: list[str] = ["🍒", "🍋", "🍉", "🔔", "💎", "🎰"]
 
+# Pity: guarantee 3-of-a-kind within first 5 spins. Weights when forcing (small chance jackpot/diamond).
+PITY_TRIPLE_WEIGHTS: list[tuple[str, float]] = [
+    ("🎰", 0.02),   # 2% jackpot
+    ("💎", 0.05),   # 5% diamond
+    ("🍒", 0.2325), ("🍋", 0.2325), ("🍉", 0.2325), ("🔔", 0.2325),  # 93% others
+]
+
 
 def _spin_grid() -> list[list[str]]:
     """Generate a fresh 3×3 grid of random slot symbols."""
     return [[random.choice(SLOT_SYMBOLS) for _ in range(3)] for _ in range(3)]
+
+
+def _spin_grid_with_pity(guild_id: int, uid: int) -> list[list[str]]:
+    """
+    Generate 3×3 grid. For first 5 spins, one randomly chosen spin (1–5) is guaranteed triple;
+    which spin is chosen at random when they first spin, so players can't predict it.
+    """
+    spin_count, pity_trigger_at = ensure_pity_trigger_and_get(guild_id, uid)
+    next_spin_number = spin_count + 1
+    force_triple = next_spin_number <= 5 and next_spin_number == pity_trigger_at
+
+    if force_triple:
+        symbols = [s for s, _ in PITY_TRIPLE_WEIGHTS]
+        weights = [w for _, w in PITY_TRIPLE_WEIGHTS]
+        chosen = random.choices(symbols, weights=weights, k=1)[0]
+        middle = [chosen, chosen, chosen]
+        top    = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
+        bottom = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
+        return [top, middle, bottom]
+
+    return _spin_grid()
 
 
 def _calc_slots_payout(middle_row: list[str], bet: int) -> tuple[int, str]:
@@ -1830,10 +1966,12 @@ async def _run_slots(
 
     await asyncio.sleep(1.5)
 
-    grid   = _spin_grid()
+    grid   = _spin_grid_with_pity(guild_id, uid)
     middle = grid[1]
     payout, result_desc = _calc_slots_payout(middle, bet)
     net = payout - bet
+
+    update_slots_pity_after_spin(guild_id, uid)
 
     # Debt tax on net winnings
     tax_line = ""
@@ -1866,7 +2004,7 @@ async def _run_slots(
     result_embed.add_field(name="Net",     value=net_str,                inline=True)
     result_embed.add_field(name="Balance", value=f"**{new_gold:,} 💰**", inline=True)
     if new_gold <= 0 and net < 0:
-        result_embed.set_footer(text="💸 Broke? Use !daily to claim your daily Gold!")
+        result_embed.set_footer(text="💸 Broke? Use /daily to claim your daily Gold!")
 
     await msg.edit(embed=result_embed)
 
