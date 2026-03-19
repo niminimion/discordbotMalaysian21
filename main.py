@@ -411,15 +411,16 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             )
         return
 
-    # Fallback generic error message
+    # Fallback generic error message (include error detail to help debugging)
+    detail = f"{error.__class__.__name__}: {error}"
     if interaction.response.is_done():
         await interaction.followup.send(
-            "❌ An error occurred while running this command. Please try again later.",
+            f"❌ An error occurred while running this command.\n`{detail}`",
             ephemeral=True,
         )
     else:
         await interaction.response.send_message(
-            "❌ An error occurred while running this command. Please try again later.",
+            f"❌ An error occurred while running this command.\n`{detail}`",
             ephemeral=True,
         )
 
