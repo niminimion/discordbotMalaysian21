@@ -124,6 +124,9 @@ if DATABASE_URL:
         def commit(self) -> None:
             self._conn.commit()
 
+        def rollback(self) -> None:
+            self._conn.rollback()
+
     db = _DB(DATABASE_URL)
     print("[DB] Connected → PostgreSQL (Supabase)")
 
@@ -268,6 +271,11 @@ def get_rob_data(guild_id: int, user_id: int) -> tuple[str | None, int]:
     except Exception:
         # Best-effort lazy migration: add columns if missing, then retry once.
         try:
+            # Reset broken transaction state on Postgres if needed
+            try:
+                db.rollback()  # type: ignore[attr-defined]
+            except Exception:
+                pass
             db.execute("ALTER TABLE user_gold ADD COLUMN last_rob_date TEXT")
             db.commit()
         except Exception:
