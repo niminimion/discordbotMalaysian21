@@ -21,6 +21,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands, ui
 from typing import Literal
+from datetime import timezone, timedelta
 from dotenv import load_dotenv
 from blackjack import GameTable, PlayerState
 from card_renderer import render_hand_image
@@ -32,15 +33,55 @@ from card_renderer import render_hand_image
 load_dotenv()
 TOKEN: str = os.getenv("DISCORD_TOKEN")
 
-DAILY_REWARD:        int   = 300   # Gold awarded by !daily
+DAILY_REWARD:        int   = 500   # Gold awarded by /daily (updated from 300 to 500)
 DEBT_TAX_RATE:       float = 0.30  # 30% tax on net winnings when in debt
 FREE_PLAY_TOKEN_BET: int   = 1     # token bet size in free-play mode
+MAX_BET:             int   = 5000  # Maximum bet amount across all gambling commands
+MAX_DEBT:            int   = -10000  # Minimum allowed Gold balance (debt floor)
 
 DEBT_WARNING = (
     "⚠️ You are gambling on borrowed Gold! "
     "If you win, **30% interest** will be deducted from your profits! "
     "Run out of Gold? Use `/daily` to claim your daily relief fund!"
 )
+
+
+# ---------------------------------------------------------------------------
+# Timezone Helper
+# ---------------------------------------------------------------------------
+
+def get_today_myt() -> str:
+    """
+    Return the current date in Malaysia Time (UTC+8) as 'YYYY-MM-DD' string.
+    """
+    myt = timezone(timedelta(hours=8))
+    now_myt = datetime.datetime.now(myt)
+    return now_myt.strftime('%Y-%m-%d')
+
+
+# ---------------------------------------------------------------------------
+# Economic Firewall Validation
+# ---------------------------------------------------------------------------
+
+def validate_bet_with_firewall(guild_id: int, user_id: int, bet: int) -> tuple[bool, str]:
+    """
+    Validate bet against economic firewall rules.
+    
+    Returns (is_valid, error_message).
+    If is_valid is True, error_message is empty.
+    """
+    # Check MAX_BET
+    if bet > MAX_BET:
+        return False, f"❌ Bet exceeds maximum allowed ({MAX_BET:,} 💰)"
+    
+    # Check MAX_DEBT for in-debt players
+    current_gold = get_gold(guild_id, user_id)
+    if current_gold <= 0:
+        projected_debt = current_gold - int(bet * 1.3)
+        if projected_debt < MAX_DEBT:
+            return False, f"🚫 Ah Long credit limit reached! Maximum debt is {MAX_DEBT:,} 💰. Your projected debt would be {projected_debt:,} 💰."
+    
+    return True, ""
 
 # ---------------------------------------------------------------------------
 # Database  (PostgreSQL in cloud via Supabase, SQLite for local dev)
@@ -128,6 +169,20 @@ try:
     db.commit()
 except Exception:
     pass
+
+# Add new columns for robbery tracking
+try:
+    db.execute("ALTER TABLE user_gold ADD COLUMN last_rob_date TEXT")
+    db.commit()
+except Exception:
+    pass
+
+try:
+    db.execute("ALTER TABLE user_gold ADD COLUMN rob_count INTEGER DEFAULT 0")
+    db.commit()
+except Exception:
+    pass
+
 db.commit()
 
 
@@ -162,6 +217,22 @@ def add_gold(guild_id: int, user_id: int, amount: int) -> int:
     return new_val
 
 
+def set_gold(guild_id: int, user_id: int, new_val: int) -> int:
+    """
+    Set Gold balance for a player in this guild.
+    Returns the new balance.
+    """
+    db.execute(
+        """
+        INSERT INTO user_gold (guild_id, user_id, gold) VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, user_id) DO UPDATE SET gold = excluded.gold
+        """,
+        (guild_id, user_id, new_val),
+    )
+    db.commit()
+    return new_val
+
+
 def get_last_daily(guild_id: int, user_id: int) -> str | None:
     row = db.execute(
         "SELECT last_daily FROM user_gold WHERE guild_id = ? AND user_id = ?",
@@ -179,6 +250,53 @@ def set_last_daily(guild_id: int, user_id: int, ts: str) -> None:
         (guild_id, user_id, ts),
     )
     db.commit()
+
+
+def get_rob_data(guild_id: int, user_id: int) -> tuple[str | None, int]:
+    """
+    Fetch (last_rob_date, rob_count) for a user.
+    Returns (None, 0) for first-time users.
+    """
+    row = db.execute(
+        "SELECT last_rob_date, rob_count FROM user_gold WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id),
+    ).fetchone()
+    if row is None:
+        return None, 0
+    return row[0], row[1] if row[1] is not None else 0
+
+
+def update_rob_data(guild_id: int, user_id: int, date: str, count: int) -> None:
+    """
+    Update last_rob_date and rob_count for a user.
+    """
+    db.execute(
+        """
+        INSERT INTO user_gold (guild_id, user_id, gold, last_rob_date, rob_count) 
+        VALUES (?, ?, 0, ?, ?)
+        ON CONFLICT(guild_id, user_id) DO UPDATE SET 
+            last_rob_date = excluded.last_rob_date,
+            rob_count = excluded.rob_count
+        """,
+        (guild_id, user_id, date, count),
+    )
+    db.commit()
+
+
+def reset_rob_count_if_new_day(guild_id: int, user_id: int, today: str) -> int:
+    """
+    Check if last_rob_date differs from today (MYT).
+    If different, reset rob_count to 0 and update date.
+    Returns current rob_count.
+    """
+    last_rob_date, rob_count = get_rob_data(guild_id, user_id)
+    
+    if last_rob_date != today:
+        # New day - reset count
+        update_rob_data(guild_id, user_id, today, 0)
+        return 0
+    
+    return rob_count
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +388,36 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    """Global error handler for slash commands."""
+    if isinstance(error, app_commands.CommandOnCooldown):
+        retry_after = int(error.retry_after)
+        minutes, seconds = divmod(retry_after, 60)
+        if minutes > 0:
+            time_str = f"{minutes}m {seconds}s"
+        else:
+            time_str = f"{seconds}s"
+
+        await interaction.response.send_message(
+            f"⏳ This command is on cooldown. Try again in **{time_str}**.",
+            ephemeral=True,
+        )
+        return
+
+    # Fallback generic error message
+    try:
+        await interaction.response.send_message(
+            "❌ An error occurred while running this command. Please try again later.",
+            ephemeral=True,
+        )
+    except discord.InteractionResponded:
+        await interaction.followup.send(
+            "❌ An error occurred while running this command. Please try again later.",
+            ephemeral=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Health check server  (Koyeb port check + UptimeRobot keep-alive)
 # ---------------------------------------------------------------------------
@@ -319,7 +467,7 @@ async def on_message(message: discord.Message) -> None:
 # Command: !daily
 # ---------------------------------------------------------------------------
 
-@bot.tree.command(name="daily", description="Claim 300 Gold — once every 24 hours")
+@bot.tree.command(name="daily", description="Claim 500 Gold once per day (resets at midnight MYT)")
 async def cmd_daily(interaction: discord.Interaction) -> None:
     if not interaction.guild:
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
@@ -327,37 +475,201 @@ async def cmd_daily(interaction: discord.Interaction) -> None:
 
     guild_id = interaction.guild.id
     uid      = interaction.user.id
-    now      = datetime.datetime.utcnow()
+    today    = get_today_myt()
     last_str = get_last_daily(guild_id, uid)
 
-    if last_str:
-        last_dt   = datetime.datetime.fromisoformat(last_str)
-        elapsed   = now - last_dt
-        cooldown  = datetime.timedelta(hours=24)
-        if elapsed < cooldown:
-            remaining  = cooldown - elapsed
-            total_secs = int(remaining.total_seconds())
-            hours, rem = divmod(total_secs, 3600)
-            minutes    = rem // 60
-            await interaction.response.send_message(
-                f"⏰ Already claimed! Come back in **{hours}h {minutes}m**.",
-                ephemeral=True,
-            )
-            return
+    # Check if already claimed today (MYT)
+    if last_str == today:
+        await interaction.response.send_message(
+            "❌ You already claimed your daily relief! Wait until midnight (MYT) for the reset.",
+            ephemeral=True,
+        )
+        return
 
+    # Award 500 Gold and update last_daily
     new_bal = add_gold(guild_id, uid, DAILY_REWARD)
-    set_last_daily(guild_id, uid, now.isoformat())
+    set_last_daily(guild_id, uid, today)
 
-    color = discord.Color.green() if new_bal >= 0 else discord.Color.orange()
-    embed = discord.Embed(
-        title="🎁 Daily Reward",
-        description=f"{interaction.user.mention} claimed **{DAILY_REWARD:,} 💰**!",
-        color=color,
+    await interaction.response.send_message(
+        "✅ Here is your daily 500 gold. Don't lose it all at once!"
     )
-    embed.add_field(name="New Balance", value=f"**{new_bal:,} 💰**", inline=False)
-    if new_bal < 0:
-        embed.set_footer(text="💸 Still in debt — keep grinding!")
-    await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# Command: /work, /scratch, /yolo  (Debt Redemption)
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="work", description="Wash dishes to earn 50 Gold (10 min cooldown)")
+@app_commands.checks.cooldown(1, 10 * 60)
+async def cmd_work(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+    uid = interaction.user.id
+    gold_before = get_gold(guild_id, uid)
+
+    # 1% Rolex event
+    if random.randint(1, 100) == 1 and gold_before < 0:
+        set_gold(guild_id, uid, 0)
+        await interaction.response.send_message(
+            "✨ Holy cow! You found a discarded Rolex in the drain! Your Ah Long debt is completely wiped out!"
+        )
+        return
+
+    add_gold(guild_id, uid, 50)
+    await interaction.response.send_message(
+        "🍽️ You washed dishes in the back kitchen for an hour and earned 50 gold."
+    )
+
+
+@bot.tree.command(name="scratch", description="Free scratch card for broke players (24h cooldown)")
+@app_commands.checks.cooldown(1, 24 * 60 * 60)
+async def cmd_scratch(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+    uid = interaction.user.id
+    gold_before = get_gold(guild_id, uid)
+
+    if gold_before >= 0:
+        await interaction.response.send_message(
+            "❌ Only broke people in debt can get a free scratch card!"
+        )
+        return
+
+    # 1% jackpot event
+    if random.randint(1, 100) == 1:
+        set_gold(guild_id, uid, 0)
+        await interaction.response.send_message(
+            "🎉 Jackpot! You won the Ah Long Debt Relief Grand Prize! All debts are cleared!"
+        )
+        return
+
+    await interaction.response.send_message(
+        "🗑️ Better luck next time. The scratch card says: Go back to washing dishes!"
+    )
+
+
+@bot.tree.command(name="yolo", description="Russian roulette for desperate players (24h cooldown)")
+@app_commands.checks.cooldown(1, 24 * 60 * 60)
+async def cmd_yolo(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+    uid = interaction.user.id
+    gold_before = get_gold(guild_id, uid)
+
+    if gold_before >= -1000:
+        await interaction.response.send_message(
+            "❌ Only desperate players with gold below -1000 can use /yolo.",
+            ephemeral=True,
+        )
+        return
+
+    # Win (10% chance)
+    if random.randint(1, 100) <= 10:
+        set_gold(guild_id, uid, 500)
+        await interaction.response.send_message(
+            "🔫 *Click*. The gun is empty! Ah Long respects your guts. He clears your debt and gives you 500 gold to start over!"
+        )
+        return
+
+    # Lose case (not specified in your message, keep consistent with prior design)
+    new_gold = int(gold_before * 1.5)
+    set_gold(guild_id, uid, new_gold)
+    await interaction.response.send_message(
+        "💥 *Bang*! You lost! Ah Long beats you up and adds the medical bills to your tab. Your debt increases by 50%!"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Command: /rob
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="rob", description="Rob another player for Gold (3 attempts per day)")
+@app_commands.describe(target="The player to rob")
+async def cmd_rob(interaction: discord.Interaction, target: discord.Member) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+    robber_id = interaction.user.id
+    target_id = target.id
+    today = get_today_myt()
+
+    # Validation 1: Cannot rob yourself
+    if robber_id == target_id:
+        await interaction.response.send_message("❌ You cannot rob yourself!", ephemeral=True)
+        return
+
+    # Validation 2: Check and reset rob_count if new day
+    rob_count = reset_rob_count_if_new_day(guild_id, robber_id, today)
+
+    # Validation 3: Check daily limit (3 attempts per day)
+    if rob_count >= 3:
+        await interaction.response.send_message(
+            "🛑 Heat is too high! You've already robbed 3 times today. Lay low until midnight.",
+            ephemeral=True,
+        )
+        return
+
+    # Validation 4: Check target has Gold > 0
+    target_gold = get_gold(guild_id, target_id)
+    if target_gold <= 0:
+        await interaction.response.send_message(
+            "❌ Target is too broke. Even Ah Long is looking for them. Pick someone else!",
+            ephemeral=True,
+        )
+        return
+
+    # Increment rob_count
+    update_rob_data(guild_id, robber_id, today, rob_count + 1)
+
+    # Execute robbery with 40% success rate
+    success = random.random() < 0.40
+    robber_gold = get_gold(guild_id, robber_id)
+
+    if success:
+        # Success: Steal 20-30% of target's Gold
+        steal_percentage = random.uniform(0.20, 0.30)
+        stolen_amount = int(target_gold * steal_percentage)
+        
+        # Transfer Gold
+        add_gold(guild_id, target_id, -stolen_amount)
+        add_gold(guild_id, robber_id, stolen_amount)
+        
+        new_robber_gold = get_gold(guild_id, robber_id)
+        new_target_gold = get_gold(guild_id, target_id)
+        
+        await interaction.response.send_message(
+            f"💰 **Robbery Successful!**\n"
+            f"{interaction.user.mention} stole **{stolen_amount:,} 💰** from {target.mention}!\n\n"
+            f"**{interaction.user.display_name}**: {robber_gold:,} → **{new_robber_gold:,} 💰**\n"
+            f"**{target.display_name}**: {target_gold:,} → **{new_target_gold:,} 💰**"
+        )
+    else:
+        # Failure: Lose 10-15% of robber's Gold as penalty
+        penalty_percentage = random.uniform(0.10, 0.15)
+        penalty_amount = int(abs(robber_gold) * penalty_percentage)
+        
+        # Deduct penalty
+        add_gold(guild_id, robber_id, -penalty_amount)
+        
+        new_robber_gold = get_gold(guild_id, robber_id)
+        
+        await interaction.response.send_message(
+            f"🚨 **Robbery Failed!**\n"
+            f"{interaction.user.mention} got caught trying to rob {target.mention}!\n\n"
+            f"**Penalty**: -{penalty_amount:,} 💰\n"
+            f"**{interaction.user.display_name}**: {robber_gold:,} → **{new_robber_gold:,} 💰**"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +817,16 @@ class HTDebtConfirmView(ui.View):
             await interaction.response.send_message("This isn't your bet!", ephemeral=True)
             return
 
+        # Check MAX_DEBT before executing
+        current_gold = get_gold(self.guild_id, self.uid)
+        projected_debt = current_gold - int(self.bet_amount * 1.3)
+        if projected_debt < MAX_DEBT:
+            await interaction.response.send_message(
+                f"🚫 Ah Long credit limit reached! Maximum debt is {MAX_DEBT:,} 💰. Your projected debt would be {projected_debt:,} 💰.",
+                ephemeral=True
+            )
+            return
+
         self.done = True
         self.stop()
         for item in self.children:
@@ -596,6 +918,13 @@ async def cmd_cointoss(
     if not free_play and bet_amount <= 0:
         await interaction.response.send_message("Bet amount must be greater than 0.", ephemeral=True)
         return
+
+    # ── Economic Firewall Validation ──────────────────────────────────────────
+    if not free_play:
+        is_valid, error_msg = validate_bet_with_firewall(guild_id, uid, bet_amount)
+        if not is_valid:
+            await interaction.response.send_message(error_msg, ephemeral=True)
+            return
 
     # ── Free Play (tokens) ────────────────────────────────────────────────────
     if free_play:
@@ -1423,6 +1752,17 @@ class BjDebtConfirmView(ui.View):
             await interaction.response.send_message("This isn't your confirmation!", ephemeral=True)
             return
 
+        # Check MAX_DEBT before joining
+        table = self.lobby_view.table
+        current_gold = get_gold(table.guild_id, self.uid)
+        projected_debt = current_gold - int(table.bet * 1.3)
+        if projected_debt < MAX_DEBT:
+            await interaction.response.send_message(
+                f"🚫 Ah Long credit limit reached! Maximum debt is {MAX_DEBT:,} 💰. Your projected debt would be {projected_debt:,} 💰.",
+                ephemeral=True
+            )
+            return
+
         self.done = True
         self.stop()
         for item in self.children:
@@ -1784,6 +2124,13 @@ async def cmd_bj(interaction: discord.Interaction, bet: int = 0) -> None:
         )
         return
 
+    # Economic Firewall Validation (for Gold bets only)
+    if bet > 0:
+        is_valid, error_msg = validate_bet_with_firewall(guild_id, uid, bet)
+        if not is_valid:
+            await interaction.response.send_message(error_msg, ephemeral=True)
+            return
+
     if uid in active_player_ids:
         await interaction.response.send_message(
             "You already have an open lobby or are in a game.", ephemeral=True
@@ -2036,6 +2383,17 @@ class SlotsDebtConfirmView(ui.View):
         if not self._check(interaction):
             await interaction.response.send_message("This isn't your game!", ephemeral=True)
             return
+        
+        # Check MAX_DEBT before executing
+        current_gold = get_gold(self.guild_id, self.uid)
+        projected_debt = current_gold - int(self.bet * 1.3)
+        if projected_debt < MAX_DEBT:
+            await interaction.response.send_message(
+                f"🚫 Ah Long credit limit reached! Maximum debt is {MAX_DEBT:,} 💰. Your projected debt would be {projected_debt:,} 💰.",
+                ephemeral=True
+            )
+            return
+        
         self.done = True
         self.stop()
         for item in self.children:
@@ -2082,12 +2440,19 @@ async def cmd_slots(interaction: discord.Interaction, bet: int) -> None:
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
         return
 
+    guild_id = interaction.guild.id
+    uid = interaction.user.id
+
     if bet <= 0:
         await interaction.response.send_message("Bet must be a positive integer.", ephemeral=True)
         return
 
-    guild_id    = interaction.guild.id
-    uid         = interaction.user.id
+    # Economic Firewall Validation
+    is_valid, error_msg = validate_bet_with_firewall(guild_id, uid, bet)
+    if not is_valid:
+        await interaction.response.send_message(error_msg, ephemeral=True)
+        return
+
     gold_before = get_gold(guild_id, uid)
     in_debt     = gold_before <= 0
 
