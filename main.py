@@ -399,20 +399,26 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         else:
             time_str = f"{seconds}s"
 
-        await interaction.response.send_message(
-            f"⏳ This command is on cooldown. Try again in **{time_str}**.",
-            ephemeral=True,
-        )
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"⏳ This command is on cooldown. Try again in **{time_str}**.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"⏳ This command is on cooldown. Try again in **{time_str}**.",
+                ephemeral=True,
+            )
         return
 
     # Fallback generic error message
-    try:
-        await interaction.response.send_message(
+    if interaction.response.is_done():
+        await interaction.followup.send(
             "❌ An error occurred while running this command. Please try again later.",
             ephemeral=True,
         )
-    except discord.InteractionResponded:
-        await interaction.followup.send(
+    else:
+        await interaction.response.send_message(
             "❌ An error occurred while running this command. Please try again later.",
             ephemeral=True,
         )
