@@ -401,12 +401,12 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
         if interaction.response.is_done():
             await interaction.followup.send(
-                f"⏳ This command is on cooldown. Try again in **{time_str}**.",
+                f"⏳ [v3] This command is on cooldown. Try again in **{time_str}**.",
                 ephemeral=True,
             )
         else:
             await interaction.response.send_message(
-                f"⏳ This command is on cooldown. Try again in **{time_str}**.",
+                f"⏳ [v3] This command is on cooldown. Try again in **{time_str}**.",
                 ephemeral=True,
             )
         return
