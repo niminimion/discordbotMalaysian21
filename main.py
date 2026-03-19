@@ -256,11 +256,35 @@ def get_rob_data(guild_id: int, user_id: int) -> tuple[str | None, int]:
     """
     Fetch (last_rob_date, rob_count) for a user.
     Returns (None, 0) for first-time users.
+
+    On Postgres/Supabase, this also lazily adds the robbery columns if they
+    were not created yet, so we don't crash with UndefinedColumn.
     """
-    row = db.execute(
-        "SELECT last_rob_date, rob_count FROM user_gold WHERE guild_id = ? AND user_id = ?",
-        (guild_id, user_id),
-    ).fetchone()
+    try:
+        row = db.execute(
+            "SELECT last_rob_date, rob_count FROM user_gold WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        ).fetchone()
+    except Exception:
+        # Best-effort lazy migration: add columns if missing, then retry once.
+        try:
+            db.execute("ALTER TABLE user_gold ADD COLUMN last_rob_date TEXT")
+            db.commit()
+        except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE user_gold ADD COLUMN rob_count INTEGER DEFAULT 0")
+            db.commit()
+        except Exception:
+            pass
+        try:
+            row = db.execute(
+                "SELECT last_rob_date, rob_count FROM user_gold WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            ).fetchone()
+        except Exception:
+            return None, 0
+
     if row is None:
         return None, 0
     return row[0], row[1] if row[1] is not None else 0
