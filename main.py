@@ -2546,8 +2546,9 @@ async def cmd_joinvc(interaction: discord.Interaction) -> None:
             )
             return
         await current_vc.move_to(target_vc)
+        await interaction.guild.change_voice_state(channel=target_vc, self_deaf=True, self_mute=True)
     else:
-        await target_vc.connect()
+        await target_vc.connect(self_deaf=True, self_mute=True)
 
     await interaction.response.send_message(f"✅ Joined **{target_vc.name}**.")
 
