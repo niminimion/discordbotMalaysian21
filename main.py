@@ -416,6 +416,7 @@ def update_slots_pity_after_spin(guild_id: int, user_id: int) -> None:
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -2513,6 +2514,59 @@ async def cmd_slots(interaction: discord.Interaction, bet: int) -> None:
     await interaction.response.defer()
     add_gold(guild_id, uid, -bet)
     await _run_slots(interaction.channel, guild_id, uid, bet, in_debt=False)
+
+
+# ---------------------------------------------------------------------------
+# Commands: /joinvc  /leavevc  (admin-only voice channel idle)
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="joinvc", description="[Admin] Join the voice channel you're currently in")
+@app_commands.checks.has_permissions(administrator=True)
+async def cmd_joinvc(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    member = interaction.guild.get_member(interaction.user.id)
+    user_vc = member.voice.channel if (member and member.voice) else None
+    channel_vc = interaction.channel if isinstance(interaction.channel, discord.VoiceChannel) else None
+
+    target_vc = user_vc or channel_vc
+    if target_vc is None:
+        await interaction.response.send_message(
+            "❌ Join a voice channel first, or run this command in a voice channel's chat.", ephemeral=True
+        )
+        return
+    current_vc = interaction.guild.voice_client
+
+    if current_vc is not None:
+        if current_vc.channel == target_vc:
+            await interaction.response.send_message(
+                f"Already in **{target_vc.name}**.", ephemeral=True
+            )
+            return
+        await current_vc.move_to(target_vc)
+    else:
+        await target_vc.connect()
+
+    await interaction.response.send_message(f"✅ Joined **{target_vc.name}**.")
+
+
+@bot.tree.command(name="leavevc", description="[Admin] Leave the current voice channel")
+@app_commands.checks.has_permissions(administrator=True)
+async def cmd_leavevc(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    vc = interaction.guild.voice_client
+    if vc is None:
+        await interaction.response.send_message("❌ Not in any voice channel.", ephemeral=True)
+        return
+
+    channel_name = vc.channel.name
+    await vc.disconnect()
+    await interaction.response.send_message(f"👋 Left **{channel_name}**.")
 
 
 # ---------------------------------------------------------------------------
