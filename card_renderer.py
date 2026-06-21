@@ -46,6 +46,38 @@ async def _fetch_one(session: aiohttp.ClientSession, code: str) -> Image.Image |
     return None
 
 
+async def render_cards_image(cards: list) -> io.BytesIO | None:
+    """
+    Fetch card images for a plain list of Card objects and stitch them side-by-side.
+    Used by Texas Hold'em (hole cards are a list, not a Hand).
+    Returns None if every fetch failed.
+    """
+    if not cards:
+        return None
+
+    async with aiohttp.ClientSession() as session:
+        results = await asyncio.gather(
+            *[_fetch_one(session, card.image_code) for card in cards]
+        )
+
+    images = [img for img in results if img is not None]
+    if not images:
+        return None
+
+    total_w = sum(img.width for img in images) + CARD_GAP * (len(images) - 1)
+    canvas  = Image.new("RGB", (total_w, CARD_H), BG_COLOUR)
+
+    x = 0
+    for img in images:
+        canvas.paste(img, (x, 0), img)
+        x += img.width + CARD_GAP
+
+    buffer = io.BytesIO()
+    canvas.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
 async def render_hand_image(hand: Hand) -> io.BytesIO | None:
     """
     Fetch all cards in the hand in parallel, stitch them side-by-side,
