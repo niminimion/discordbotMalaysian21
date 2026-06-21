@@ -1124,6 +1124,18 @@ def _cleanup_table(table: GameTable) -> None:
     active_player_ids.difference_update(table.all_player_ids)
 
 
+def _check_active(uid: int, guild_id: int) -> bool:
+    """Return True only if uid is genuinely in a live table/lobby in this guild.
+    Removes stale active_player_ids entries caused by restarts or missed cleanups."""
+    if uid not in active_player_ids:
+        return False
+    for table in active_tables.values():
+        if table.guild_id == guild_id and any(p.user_id == uid for p in table.all_participants):
+            return True
+    active_player_ids.discard(uid)
+    return False
+
+
 async def _ping_turn(interaction: discord.Interaction, table: GameTable) -> None:
     """
     Send a NEW (non-ephemeral) channel message pinging the current player.
@@ -1158,8 +1170,11 @@ def _settle_staked(table: GameTable) -> tuple[list[str], int]:
 
     for player in table.players:
         if player.escaped:
-            lines.append(f"**{player.name}**: 🏃 Escaped (bet refunded)")
-            # bet was already returned in GameView.escape — do not add_gold again
+            if getattr(player, 'quit', False):
+                lines.append(f"**{player.name}**: 🚪 Quit (bet forfeited to banker)")
+            else:
+                lines.append(f"**{player.name}**: 🏃 Escaped (bet refunded)")
+            # bet already handled in quit/escape handler — do not add_gold again
             continue
 
         payout, desc    = _calc_payout(player, banker, table.bet)
@@ -1365,10 +1380,94 @@ class GameView(ui.View):
         super().__init__(timeout=300)
         self.table   = table
         self.message: discord.Message | None = None
+        self._turn_task: asyncio.Task | None = None
+
+    # --- Turn timer ---------------------------------------------------------
+
+    def _cancel_turn_timer(self) -> None:
+        if self._turn_task and not self._turn_task.done():
+            self._turn_task.cancel()
+        self._turn_task = None
+
+    def _start_turn_timer(self, channel: discord.abc.Messageable) -> None:
+        self._cancel_turn_timer()
+        table = self.table
+        if table.phase != "playing" or table.current_participant is None:
+            return
+        uid = table.current_participant.user_id
+        self._turn_task = asyncio.create_task(self._auto_act(channel, uid))
+
+    async def _auto_act(self, channel: discord.abc.Messageable, expected_uid: int) -> None:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            return
+        table = self.table
+        if table.phase != "playing":
+            return
+        current = table.current_participant
+        if current is None or current.user_id != expected_uid:
+            return
+        current.status = "stood"
+        should_resolve = table.advance()
+        await channel.send(f"⏰ <@{expected_uid}> timed out — auto-stood!")
+        if should_resolve:
+            await self._resolve_no_interaction(channel)
+        else:
+            nxt = table.current_participant
+            embed = build_board_embed(table)
+            if nxt:
+                embed.set_footer(text=f"⏰ {current.name} timed out  |  Now: {nxt.name}")
+            if self.message:
+                try:
+                    await self.message.delete()
+                except Exception:
+                    pass
+            self.message = await channel.send(embed=embed, view=self)
+            if nxt:
+                await channel.send(f"▶️ <@{nxt.user_id}> it's your turn!")
+            self._start_turn_timer(channel)
+
+    async def _resolve_no_interaction(self, channel: discord.abc.Messageable) -> None:
+        table = self.table
+        table.phase = "finished"
+        free_play = table.bet == 0
+        if free_play:
+            lines, tok_lines = _settle_free_play(table)
+        else:
+            lines, banker_net = _settle_staked(table)
+            banker_total = table.banker_escrow + banker_net
+            add_gold(table.guild_id, table.banker_id, max(0, banker_total))
+            net_str = f"+{banker_net:,}" if banker_net >= 0 else f"{banker_net:,}"
+            lines.append(f"**{table.banker.name} (Banker)**: Net **{net_str}** 💰")
+            tok_lines = None
+        board_embed = build_board_embed(table, reveal=True)
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        if self.message:
+            try:
+                await self.message.edit(content="", embed=board_embed, view=self)
+            except Exception:
+                pass
+        all_mentions = " ".join(f"<@{p.user_id}>" for p in table.all_participants)
+        result_embed = discord.Embed(
+            title="🏁  Game Over — Results",
+            description=f"{all_mentions}\n\n" + "\n".join(lines),
+            color=discord.Color.blurple(),
+        )
+        if free_play and tok_lines:
+            result_embed.add_field(name="🪙 Token Balances", value="\n".join(tok_lines), inline=False)
+            result_embed.set_footer(text=f"Free Play — bet {FREE_PLAY_TOKEN_BET} tokens each")
+        else:
+            result_embed.set_footer(text=f"Bet: {table.bet:,} 💰 each")
+        participants = [(p.user_id, p.name) for p in table.all_participants]
+        rematch_view = RematchView(bet=table.bet, guild_id=table.guild_id, participants=participants)
+        _cleanup_table(table)
+        await channel.send(embed=result_embed, view=rematch_view)
 
     # --- Hit ----------------------------------------------------------------
 
-    @ui.button(label="🎯 Hit", style=discord.ButtonStyle.primary)
+    @ui.button(label="🎯 Hit", style=discord.ButtonStyle.primary, row=0)
     async def hit(
         self, interaction: discord.Interaction, button: ui.Button
     ) -> None:
@@ -1379,6 +1478,7 @@ class GameView(ui.View):
             await interaction.response.send_message("It's not your turn!", ephemeral=True)
             return
 
+        self._cancel_turn_timer()
         card = table.deck.deal()
         current.hand.add(card)
 
@@ -1420,6 +1520,7 @@ class GameView(ui.View):
             self.message = await interaction.channel.send(embed=embed, view=self)
             if auto_end:
                 await _ping_turn(interaction, table)
+            self._start_turn_timer(interaction.channel)
 
         buf = await render_hand_image(current.hand)
         if buf:
@@ -1431,7 +1532,7 @@ class GameView(ui.View):
 
     # --- Stand  (blocked if score < 16) -------------------------------------
 
-    @ui.button(label="🛑 Stand", style=discord.ButtonStyle.secondary)
+    @ui.button(label="🛑 Stand", style=discord.ButtonStyle.secondary, row=0)
     async def stand(
         self, interaction: discord.Interaction, button: ui.Button
     ) -> None:
@@ -1441,6 +1542,8 @@ class GameView(ui.View):
         if current is None or interaction.user.id != current.user_id:
             await interaction.response.send_message("It's not your turn!", ephemeral=True)
             return
+
+        self._cancel_turn_timer()
 
         if current.hand.must_hit and not current.hand.special:
             await interaction.response.send_message(
@@ -1468,10 +1571,11 @@ class GameView(ui.View):
                     pass
             self.message = await interaction.channel.send(embed=embed, view=self)
             await _ping_turn(interaction, table)
+            self._start_turn_timer(interaction.channel)
 
     # --- Escape (🏃 走) — only on initial 2-card deal with 15 or 16 ---------
 
-    @ui.button(label="🏃 Escape (走)", style=discord.ButtonStyle.danger)
+    @ui.button(label="🏃 Escape (走)", style=discord.ButtonStyle.danger, row=0)
     async def escape(
         self, interaction: discord.Interaction, button: ui.Button
     ) -> None:
@@ -1481,6 +1585,8 @@ class GameView(ui.View):
         if current is None or interaction.user.id != current.user_id:
             await interaction.response.send_message("It's not your turn!", ephemeral=True)
             return
+
+        self._cancel_turn_timer()
 
         if not current.hand.can_escape:
             await interaction.response.send_message(
@@ -1511,10 +1617,11 @@ class GameView(ui.View):
                     pass
             self.message = await interaction.channel.send(embed=embed, view=self)
             await _ping_turn(interaction, table)
+            self._start_turn_timer(interaction.channel)
 
     # --- My Cards (ephemeral — only you can see this) -----------------------
 
-    @ui.button(label="🃏 My Cards", style=discord.ButtonStyle.grey)
+    @ui.button(label="🃏 My Cards", style=discord.ButtonStyle.grey, row=1)
     async def my_cards(
         self, interaction: discord.Interaction, button: ui.Button
     ) -> None:
@@ -1543,7 +1650,7 @@ class GameView(ui.View):
 
     # --- Refresh (repost board + reset 5-min button timer) ------------------
 
-    @ui.button(label="🔄 Refresh", style=discord.ButtonStyle.grey)
+    @ui.button(label="🔄 Refresh", style=discord.ButtonStyle.grey, row=1)
     async def refresh(
         self, interaction: discord.Interaction, button: ui.Button
     ) -> None:
@@ -1574,10 +1681,139 @@ class GameView(ui.View):
             embed=build_board_embed(table), view=new_view
         )
 
+    # --- Quit (player forfeits bet to banker) --------------------------------
+
+    @ui.button(label="🚪 Quit", style=discord.ButtonStyle.danger, row=2)
+    async def quit_game(
+        self, interaction: discord.Interaction, button: ui.Button
+    ) -> None:
+        table = self.table
+        uid   = interaction.user.id
+
+        if uid == table.banker_id:
+            await interaction.response.send_message(
+                "Banker cannot quit — use 🏳️ End Game instead.", ephemeral=True
+            )
+            return
+
+        player = next((p for p in table.players if p.user_id == uid and not p.escaped), None)
+        if player is None:
+            await interaction.response.send_message("You're not an active player.", ephemeral=True)
+            return
+
+        if table.phase != "playing":
+            await interaction.response.send_message("Game is not in progress.", ephemeral=True)
+            return
+
+        is_current = table.current_participant is not None and table.current_participant.user_id == uid
+        if is_current:
+            self._cancel_turn_timer()
+
+        # Forfeit bet to banker
+        free_play = table.bet == 0
+        if free_play:
+            add_tokens(table.banker_id, FREE_PLAY_TOKEN_BET)
+        else:
+            add_gold(table.guild_id, table.banker_id, table.bet)
+
+        player.escaped = True
+        setattr(player, 'quit', True)
+        active_player_ids.discard(uid)
+
+        active_after = [p for p in table.players if not p.escaped]
+        if not active_after:
+            await resolve_table(table, self, interaction)
+            return
+
+        should_resolve = table.advance() if is_current else False
+
+        if should_resolve:
+            await resolve_table(table, self, interaction)
+        else:
+            embed = build_board_embed(table)
+            await interaction.response.defer()
+            if self.message:
+                try:
+                    await self.message.delete()
+                except Exception:
+                    pass
+            self.message = await interaction.channel.send(embed=embed, view=self)
+            await interaction.followup.send(
+                f"🚪 **{interaction.user.display_name}** quit — bet forfeited to banker.",
+                ephemeral=False,
+            )
+            if is_current:
+                nxt = table.current_participant
+                if nxt:
+                    await interaction.followup.send(f"▶️ <@{nxt.user_id}> it's your turn!", ephemeral=False)
+                self._start_turn_timer(interaction.channel)
+
+    # --- End Game (banker surrenders escrow) ---------------------------------
+
+    @ui.button(label="🏳️ End Game", style=discord.ButtonStyle.secondary, row=2)
+    async def end_game(
+        self, interaction: discord.Interaction, button: ui.Button
+    ) -> None:
+        table = self.table
+
+        if interaction.user.id != table.banker_id:
+            await interaction.response.send_message("Only the banker can end the game early.", ephemeral=True)
+            return
+
+        if table.phase != "playing":
+            await interaction.response.send_message("Game is not in progress.", ephemeral=True)
+            return
+
+        self._cancel_turn_timer()
+        table.phase = "finished"
+        free_play   = table.bet == 0
+
+        active_players = [p for p in table.players if not p.escaped]
+        n = len(active_players)
+        lines: list[str] = []
+
+        for p in table.players:
+            if p.escaped:
+                label = "🚪 Already quit" if getattr(p, 'quit', False) else "🏃 Already escaped"
+                lines.append(f"**{p.name}**: {label}")
+                continue
+            if free_play:
+                add_tokens(p.user_id, FREE_PLAY_TOKEN_BET)
+                lines.append(f"**{p.name}**: 🪙 Token returned")
+            else:
+                share = table.banker_escrow // n if n > 0 else 0
+                add_gold(table.guild_id, p.user_id, table.bet + share)
+                lines.append(f"**{p.name}**: Bet returned + **{share:,}** 💰 bonus from banker")
+
+        if not free_play:
+            remainder = table.banker_escrow % n if n > 0 else table.banker_escrow
+            if remainder > 0:
+                add_gold(table.guild_id, table.banker_id, remainder)
+            lines.append(
+                f"**{table.banker.name} (Banker)**: 🏳️ Forfeited **{table.banker_escrow:,}** 💰 escrow to players"
+            )
+        else:
+            lines.append(f"**{table.banker.name} (Banker)**: 🏳️ Ended game early")
+
+        board_embed = build_board_embed(table, reveal=True)
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+
+        all_mentions = " ".join(f"<@{p.user_id}>" for p in table.all_participants)
+        result_embed = discord.Embed(
+            title="🏳️  Banker Ended Game Early",
+            description=f"{all_mentions}\n\n" + "\n".join(lines),
+            color=discord.Color.orange(),
+        )
+        _cleanup_table(table)
+        await interaction.response.edit_message(content="", embed=board_embed, view=self)
+        await interaction.followup.send(embed=result_embed, ephemeral=False)
+
     # --- Timeout ------------------------------------------------------------
 
     async def on_timeout(self) -> None:
         """Refund all non-escaped players + full banker escrow on timeout."""
+        self._cancel_turn_timer()
         table = self.table
         if table.phase == "finished":
             return
@@ -1642,7 +1878,7 @@ class RematchView(ui.View):
             )
             return
 
-        if uid in active_player_ids:
+        if _check_active(uid, self.guild_id):
             await interaction.response.send_message(
                 "You're already in another game — can't join the rematch.", ephemeral=True
             )
@@ -1724,6 +1960,7 @@ class RematchView(ui.View):
             view=game_view,
         )
         game_view.message = interaction.message
+        game_view._start_turn_timer(interaction.channel)
 
         # Debt warnings (public)
         for p in debt_players:
@@ -1814,7 +2051,7 @@ class BjDebtConfirmView(ui.View):
         table = lv.table
         uid   = self.uid
 
-        if uid in active_player_ids:
+        if _check_active(uid, lv.table.guild_id):
             await interaction.followup.send("You're already in a game or lobby.", ephemeral=True)
             return
 
@@ -1895,7 +2132,7 @@ class LobbyView(ui.View):
         table = self.table
         uid   = interaction.user.id
 
-        if uid in active_player_ids:
+        if _check_active(uid, table.guild_id):
             await interaction.response.send_message(
                 "You're already in a game or lobby.", ephemeral=True
             )
@@ -2037,6 +2274,7 @@ class LobbyView(ui.View):
         embed = build_board_embed(table)
         await interaction.response.edit_message(content="", embed=embed, view=game_view)
         game_view.message = interaction.message
+        game_view._start_turn_timer(interaction.channel)
 
         # Debt warnings for in-debt players (public so everyone sees)
         for p in debt_players:
@@ -2171,7 +2409,7 @@ async def cmd_bj(interaction: discord.Interaction, bet: int = 0) -> None:
             await interaction.response.send_message(error_msg, ephemeral=True)
             return
 
-    if uid in active_player_ids:
+    if _check_active(uid, guild_id):
         await interaction.response.send_message(
             "You already have an open lobby or are in a game.", ephemeral=True
         )
