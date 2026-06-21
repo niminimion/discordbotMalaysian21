@@ -835,6 +835,227 @@ async def cmd_disclaimer(interaction: discord.Interaction) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Command: /instruction
+# ---------------------------------------------------------------------------
+
+instruction_group = app_commands.Group(name="instruction", description="中英文指令说明 · Bilingual command guide")
+bot.tree.add_command(instruction_group)
+
+
+@instruction_group.command(name="economy", description="💰 经济系统指令说明 · Economy commands guide")
+async def instruction_economy(interaction: discord.Interaction) -> None:
+    eco = discord.Embed(
+        title="💰 经济系统 · Economy",
+        description="**货币 Currency:** 💰 Gold（按服务器独立 · Guild-specific）",
+        color=discord.Color.gold(),
+    )
+    eco.add_field(
+        name="指令 Commands",
+        value=(
+            "`/daily` — 每天领取 **500 Gold**（马来西亚时间午夜重置）\n"
+            "Claim **500 Gold** once per day (resets at midnight MYT)\n\n"
+            "`/work` — 打工赚 **50 Gold**（10分钟冷却）。1% 概率找到劳力士，清除所有负债\n"
+            "Earn **50 Gold** (10-min cooldown). 1% chance to find a Rolex and wipe your debt\n\n"
+            "`/scratch` — 负债玩家专属免费刮刮乐（24小时冷却）。1% 中奖直接清债\n"
+            "Free scratch card for players **in debt** (24h cooldown). 1% jackpot clears all debt\n\n"
+            "`/yolo` — 负债超过 -1000 才能用（24小时冷却）\n"
+            "10% 成功：清债 +500 Gold｜90% 失败：负债 ×1.5\n"
+            "Only for players below **-1000 Gold** (24h cooldown). 10% win: cleared +500; 90% lose: debt ×1.5\n\n"
+            "`/rob @玩家` — 抢劫其他玩家（每天3次机会）\n"
+            "40% 成功：偷取对方 20–30% Gold｜失败：自损 10–15%\n"
+            "Rob another player (3/day). 40% success: steal 20–30%; fail: lose 10–15% of yours\n\n"
+            "`/balance [@玩家]` — 查看自己或他人的 Gold 余额\n"
+            "Check your own or another player's Gold balance\n\n"
+            "`/leaderboard` — 本服务器 Gold 排行榜前 10 名\n"
+            "Top 10 richest players in this server"
+        ),
+        inline=False,
+    )
+    eco.add_field(
+        name="📉 负债系统 Debt System",
+        value=(
+            "Gold 可以变成负数，没有下限 · Gold can go negative — no floor\n\n"
+            "• 负债状态参与有赌注游戏时，会弹出 **继续 / 取消** 提示\n"
+            "  A **Continue / Cancel** prompt appears when joining staked games while in debt\n\n"
+            "• 负债期间赢钱，净利润征收 **30% 利息**（向上取整）\n"
+            "  Winnings while in debt are taxed **30%** (rounded up)"
+        ),
+        inline=False,
+    )
+    await interaction.response.send_message(embed=eco)
+
+
+@instruction_group.command(name="banluck", description="🃏 Ban-Luck 班乐玩法说明")
+async def instruction_banluck(interaction: discord.Interaction) -> None:
+    bj = discord.Embed(
+        title="🃏 Ban-Luck（班乐 / 马来西亚21点）",
+        color=discord.Color.green(),
+    )
+    bj.add_field(
+        name="指令 Commands",
+        value=(
+            "`/bj bet:<金额>` — 有赌注模式，使用 💰 Gold\n"
+            "Staked mode using Gold\n\n"
+            "`/bj` — 免费模式，使用 🎟️ 代币（每局1枚）\n"
+            "Free play using Tokens (1 per game)"
+        ),
+        inline=False,
+    )
+    bj.add_field(
+        name="玩法 Gameplay",
+        value=(
+            "开局者为**庄家**，最多4名玩家加入（合计5人）\n"
+            "Host is the **Banker**; up to 4 others join (5 total)\n\n"
+            "每人发2张暗牌，玩家依序行动，庄家最后\n"
+            "2 hidden cards each; players act in order, banker acts last\n\n"
+            "**🎯 Hit** 要牌 · **🛑 Stand** 停牌（须≥16点）· **🏃 Escape** 逃跑（初始15或16点专用，退还赌注）\n"
+            "**🃏 My Cards** 私下查牌 · **🔄 Refresh** 刷新牌桌\n\n"
+            "60秒未行动自动停牌 · Auto-Stand after 60s"
+        ),
+        inline=False,
+    )
+    bj.add_field(
+        name="特殊牌型与赔率 Special Hands & Multipliers",
+        value=(
+            "✨ **Ban-Ban（双A）** 初始两张A → **3×**\n"
+            "🌊 **Ban-Luck（过海）** A + 10/J/Q/K → **2×**\n"
+            "👯 **Double（双对子）** 初始两张同点数 → **2×**\n"
+            "🐲 **五龙 Five Dragon** 5张不爆牌 → **5×**\n"
+            "🎰 **7-7-7（三条七）** 三张7合计21 → **5×**\n"
+            "🏆 **普通胜 Normal Win** → **1×**\n\n"
+            "神仙打架：双方特殊牌型时倍率高者胜，相同则退注\n"
+            "Clash Rule: higher multiplier wins; equal = refund"
+        ),
+        inline=False,
+    )
+    bj.add_field(
+        name="A 的动态点数 Dynamic Ace",
+        value=(
+            "2张：1 / 10 / 11（最佳不爆值）· 3张：1 或 10 · 4–5张：只算 1\n"
+            "2 cards: 1/10/11 · 3 cards: 1 or 10 · 4-5 cards: 1 only"
+        ),
+        inline=False,
+    )
+    bj.set_footer(text="全员同意可 Rematch 重开，随机换庄 · Unanimous Rematch vote, random new banker")
+    await interaction.response.send_message(embed=bj)
+
+
+@instruction_group.command(name="poker", description="♠️ Texas Hold'em 德州扑克玩法说明")
+async def instruction_poker(interaction: discord.Interaction) -> None:
+    poker = discord.Embed(
+        title="♠️ Texas Hold'em 德州扑克",
+        color=discord.Color.dark_red(),
+    )
+    poker.add_field(
+        name="指令 Commands",
+        value=(
+            "`/poker [blind:<金额>]` — 开桌（默认底注50，最低10），仅限 💰 Gold\n"
+            "Open a table (default blind 50, min 10), Gold only\n\n"
+            "`/pokerstop` — 解散自己开的大厅（仅限大厅阶段，仅限房主）\n"
+            "Close your open lobby (host only, lobby phase only)"
+        ),
+        inline=False,
+    )
+    poker.add_field(
+        name="玩法 Gameplay",
+        value=(
+            "最多8人入座，至少2人才能开局\n"
+            "Up to 8 players; minimum 2 to start\n\n"
+            "**Preflop → Flop → Turn → River → Showdown**\n\n"
+            "底注：小盲 = blind，大盲 = blind × 2\n"
+            "Blinds: Small Blind = blind, Big Blind = blind × 2\n\n"
+            "开局时底牌通过**私信（DM）**单独发给每位玩家，其他人看不到\n"
+            "Hole cards sent via **DM** to each player privately\n\n"
+            "60秒未行动自动弃牌 · Auto-fold after 60s"
+        ),
+        inline=False,
+    )
+    poker.add_field(
+        name="按钮 Buttons",
+        value=(
+            "🃏 **Fold** — 弃牌 · Fold your hand\n"
+            "✅ **Check** / 📞 **Call** — 过牌 / 跟注（标签自动更新）· Check or call\n"
+            "💰 **Raise** — 加注，弹出输入框（最低 = 当前注 + 底注）· Raise via modal\n"
+            "⚡ **All In** — 全押所有 Gold · Go all-in with remaining Gold\n"
+            "🂠 **My Cards** — 私下查看底牌 + 当前最佳牌型 · View hole cards + best hand privately\n"
+            "🔄 **Refresh** — 刷新牌桌到频道底部 · Repost board to bottom of channel"
+        ),
+        inline=False,
+    )
+    poker.add_field(
+        name="牌型排名 Hand Rankings（高→低）",
+        value=(
+            "👑 Royal Flush（皇家同花顺）\n"
+            "🌊 Straight Flush（同花顺）\n"
+            "🎰 Four of a Kind（四条）\n"
+            "🏠 Full House（葫芦）\n"
+            "🎨 Flush（同花）\n"
+            "➡️ Straight（顺子）\n"
+            "🎲 Three of a Kind（三条）\n"
+            "👯 Two Pair（两对）\n"
+            "One Pair（一对）\n"
+            "High Card（高牌）"
+        ),
+        inline=False,
+    )
+    poker.set_footer(text="奖池平分给并列胜者 · Pot split equally among tied winners | 全员同意可 Rematch 重开")
+    await interaction.response.send_message(embed=poker)
+
+
+@instruction_group.command(name="games", description="🎲 其他游戏说明 · Other games guide")
+async def instruction_games(interaction: discord.Interaction) -> None:
+    other = discord.Embed(
+        title="🎲 其他游戏 · Other Games",
+        color=discord.Color.blurple(),
+    )
+    other.add_field(
+        name="🪙 猜硬币 Heads or Tails — `/ht`",
+        value=(
+            "`/ht choice:<h|t> bet:<金额>` — 有赌注，💰 Gold\n"
+            "`/ht choice:<h|t>` — 免费，🎟️ 代币\n\n"
+            "猜正面（h）或反面（t），猜对赢回 **1×** 赌注\n"
+            "Guess heads (h) or tails (t) — win **1×** your bet"
+        ),
+        inline=False,
+    )
+    other.add_field(
+        name="🎰 老虎机 Slot Machine — `/slots`",
+        value=(
+            "`/slots bet:<金额>` — 仅限 💰 Gold，无免费模式\n"
+            "Gold only, no free play\n\n"
+            "3×3 表情符号转盘，只看**中间那行**决定胜负\n"
+            "3×3 emoji grid — only the **middle row** counts\n\n"
+            "🎰🎰🎰 → **50×** JACKPOT\n"
+            "💎💎💎 → **20×** MEGA WIN\n"
+            "其他三同 Any other triple → **10×** BIG WIN\n"
+            "两同 Any pair → **1×** 保本 Push\n"
+            "全不同 All different → **0** 输 Lose"
+        ),
+        inline=False,
+    )
+    other.add_field(
+        name="🎟️ 代币系统 Token System",
+        value=(
+            "`/tokens [@玩家]` — 查看代币余额 · Check token balance\n"
+            "`/resettoken` — 重置全员代币为0 · Reset all balances to 0\n\n"
+            "代币用于 `/bj`（无赌注）和 `/ht`（无赌注），可以变负数，无下限\n"
+            "Tokens used by free-play `/bj` and `/ht`; can go negative, no floor"
+        ),
+        inline=False,
+    )
+    other.add_field(
+        name="📋 其他 Others",
+        value=(
+            "`/balance [@玩家]` — 查看 Gold 余额 · Check Gold balance\n"
+            "`/leaderboard` — 服务器排行榜 · Server leaderboard\n"
+            "`/disclaimer` — 法律免责声明 · Legal disclaimer"
+        ),
+        inline=False,
+    )
+    await interaction.response.send_message(embed=other)
+
+
+# ---------------------------------------------------------------------------
 # Debt Confirmation View — !ht
 # ---------------------------------------------------------------------------
 
