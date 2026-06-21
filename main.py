@@ -1408,16 +1408,35 @@ class GameView(ui.View):
         current = table.current_participant
         if current is None or current.user_id != expected_uid:
             return
-        current.status = "stood"
+        if current.user_id == table.banker_id:
+            await channel.send(f"⏰ <@{expected_uid}> (Banker) timed out — game ended, escrow forfeited to players!")
+            await self._auto_end_game(channel)
+        else:
+            await channel.send(f"⏰ <@{expected_uid}> timed out — auto-quit, bet forfeited to banker!")
+            await self._auto_quit_player(channel, current)
+
+    async def _auto_quit_player(self, channel: discord.abc.Messageable, player) -> None:
+        table = self.table
+        free_play = table.bet == 0
+        if free_play:
+            add_tokens(table.banker_id, FREE_PLAY_TOKEN_BET)
+        else:
+            add_gold(table.guild_id, table.banker_id, table.bet)
+        player.escaped = True
+        setattr(player, 'quit', True)
+        active_player_ids.discard(player.user_id)
+        active_after = [p for p in table.players if not p.escaped]
+        if not active_after:
+            await self._resolve_no_interaction(channel)
+            return
         should_resolve = table.advance()
-        await channel.send(f"⏰ <@{expected_uid}> timed out — auto-stood!")
         if should_resolve:
             await self._resolve_no_interaction(channel)
         else:
             nxt = table.current_participant
             embed = build_board_embed(table)
             if nxt:
-                embed.set_footer(text=f"⏰ {current.name} timed out  |  Now: {nxt.name}")
+                embed.set_footer(text=f"⏰ {player.name} timed out  |  Now: {nxt.name}")
             if self.message:
                 try:
                     await self.message.delete()
@@ -1427,6 +1446,51 @@ class GameView(ui.View):
             if nxt:
                 await channel.send(f"▶️ <@{nxt.user_id}> it's your turn!")
             self._start_turn_timer(channel)
+
+    async def _auto_end_game(self, channel: discord.abc.Messageable) -> None:
+        table = self.table
+        table.phase = "finished"
+        free_play = table.bet == 0
+        active_players = [p for p in table.players if not p.escaped]
+        n = len(active_players)
+        lines: list[str] = []
+        for p in table.players:
+            if p.escaped:
+                label = "🚪 Already quit" if getattr(p, 'quit', False) else "🏃 Already escaped"
+                lines.append(f"**{p.name}**: {label}")
+                continue
+            if free_play:
+                add_tokens(p.user_id, FREE_PLAY_TOKEN_BET)
+                lines.append(f"**{p.name}**: 🪙 Token returned")
+            else:
+                share = table.banker_escrow // n if n > 0 else 0
+                add_gold(table.guild_id, p.user_id, table.bet + share)
+                lines.append(f"**{p.name}**: Bet returned + **{share:,}** 💰 from banker's escrow")
+        if not free_play:
+            remainder = table.banker_escrow % n if n > 0 else table.banker_escrow
+            if remainder > 0:
+                add_gold(table.guild_id, table.banker_id, remainder)
+            lines.append(f"**{table.banker.name} (Banker)**: ⏰ Timed out — **{table.banker_escrow:,}** 💰 escrow forfeited")
+        else:
+            lines.append(f"**{table.banker.name} (Banker)**: ⏰ Timed out — game ended early")
+        board_embed = build_board_embed(table, reveal=True)
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        if self.message:
+            try:
+                await self.message.edit(content="", embed=board_embed, view=self)
+            except Exception:
+                pass
+        all_mentions = " ".join(f"<@{p.user_id}>" for p in table.all_participants)
+        result_embed = discord.Embed(
+            title="⏰  Banker Timed Out — Game Ended",
+            description=f"{all_mentions}\n\n" + "\n".join(lines),
+            color=discord.Color.orange(),
+        )
+        participants = [(p.user_id, p.name) for p in table.all_participants]
+        rematch_view = RematchView(bet=table.bet, guild_id=table.guild_id, participants=participants)
+        _cleanup_table(table)
+        await channel.send(embed=result_embed, view=rematch_view)
 
     async def _resolve_no_interaction(self, channel: discord.abc.Messageable) -> None:
         table = self.table
