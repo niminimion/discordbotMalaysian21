@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(run)",
+      "Skill(run:*)",
+      "Bash(python main.py)",
+      "Bash(PYTHONUTF8=1 python main.py)",
+      "Bash(PYTHONUTF8=1 python -u main.py)",
+      "Bash(pip install *)",
+      "PowerShell(Get-Process python)",
+      "PowerShell(Stop-Process -Force)",
+      "PowerShell(Get-Process python -ErrorAction SilentlyContinue)",
+      "PowerShell(Stop-Process -Force -ErrorAction SilentlyContinue)",
+      "PowerShell(exit 0)",
+      "PowerShell(cd \"d:\\\\cursor\\\\discord bot\"; $env:PYTHONUTF8=1; python -c \"import ast; ast.parse\\(open\\('main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\" 2>&1)",
+      "PowerShell(cd \"d:\\\\cursor\\\\discord bot\"; $env:PYTHONUTF8=1; python -c \"import ast; ast.parse\\(open\\('texas_poker.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\" 2>&1)",
+      "PowerShell(cd \"d:\\\\cursor\\\\discord bot\"; $env:PYTHONUTF8=1; python -u main.py 2>&1 | Select-Object -First 20)",
+      "PowerShell(cd \"d:\\\\cursor\\\\discord bot\"; $env:PYTHONUTF8=1; python -u main.py)",
+      "PowerShell(netstat -ano)",
+      "PowerShell(Stop-Process -Id 4220 -Force -ErrorAction SilentlyContinue)",
+      "Bash(cat /tmp/bot_out.txt)",
+      "Bash(jobs)",
+      "Bash(PYTHONUNBUFFERED=1 timeout 20 python -u main.py)",
+      "Bash(echo \"EXIT: $?\")"
+    ]
+  }
+}

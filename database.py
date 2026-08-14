@@ -29,7 +29,7 @@ if DATABASE_URL:
                     cur = self._conn.cursor()
                     cur.execute(sql, params)
                     return cur
-                except psycopg2.OperationalError:
+                except (psycopg2.OperationalError, psycopg2.InterfaceError):
                     if attempt == 0:
                         self._conn = self._connect()
                     else:
